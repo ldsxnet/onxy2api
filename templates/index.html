@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>onyx2api 配置管理</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b1020;
+        --panel: #121a30;
+        --muted: #98a2b3;
+        --text: #e5e7eb;
+        --ok: #22c55e;
+        --warn: #f59e0b;
+        --danger: #ef4444;
+        --line: #253051;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: linear-gradient(180deg, #070b16 0%, #0b1020 100%);
+        color: var(--text);
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      }
+      .wrap { max-width: 1100px; margin: 32px auto; padding: 0 16px; }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 18px;
+        box-shadow: 0 10px 25px rgba(0, 0, 0, .25);
+      }
+      h1 { margin: 0 0 8px 0; font-size: 24px; }
+      .sub { color: var(--muted); margin-bottom: 18px; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+      .full { grid-column: 1 / -1; }
+      label {
+        display: block;
+        font-size: 13px;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+      input, textarea {
+        width: 100%;
+        background: #0b1327;
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 10px 12px;
+        outline: none;
+      }
+      textarea { min-height: 84px; resize: vertical; }
+      .row { display: flex; gap: 8px; align-items: center; }
+      .btn {
+        border: none;
+        border-radius: 10px;
+        padding: 10px 14px;
+        color: white;
+        cursor: pointer;
+      }
+      .btn-primary { background: #2563eb; }
+      .btn-secondary { background: #334155; }
+      .btn-danger { background: #b91c1c; }
+      .status {
+        min-height: 24px;
+        margin: 14px 0;
+        font-size: 14px;
+      }
+      .ok { color: var(--ok); }
+      .warn { color: var(--warn); }
+      .danger { color: var(--danger); }
+      .kv {
+        display: grid;
+        grid-template-columns: 150px 1fr;
+        gap: 6px 10px;
+        margin-top: 8px;
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      }
+      @media (max-width: 880px) {
+        .grid { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>onyx2api 配置管理</h1>
+        <div class="sub">版本：{{ version }} ｜ 配置保存在本地 <span class="mono">config.json</span></div>
+
+        <div class="grid" style="margin-bottom: 12px;">
+          <div>
+            <label for="admin_password">管理密码（必填）</label>
+            <input id="admin_password" type="password" placeholder="输入当前管理密码" />
+          </div>
+          <div>
+            <label for="new_admin_password">新管理密码（可选）</label>
+            <input id="new_admin_password" type="password" placeholder="留空则不修改" />
+          </div>
+        </div>
+
+        <div class="status" id="status"></div>
+
+        <div class="grid">
+          <div>
+            <label for="onyx_base">Onyx Base URL</label>
+            <input id="onyx_base" type="text" placeholder="https://cloud.onyx.app" />
+          </div>
+          <div>
+            <label for="default_model">默认模型</label>
+            <input id="default_model" type="text" placeholder="claude-opus-4-6" />
+          </div>
+          <div>
+            <label for="default_persona">默认 Persona ID</label>
+            <input id="default_persona" type="number" min="1" />
+          </div>
+          <div>
+            <label for="request_timeout_seconds">请求超时（秒）</label>
+            <input id="request_timeout_seconds" type="number" min="30" />
+          </div>
+
+          <div class="full">
+            <label for="onyx_keys">ONYX Keys（每行一个）</label>
+            <textarea id="onyx_keys" placeholder="key_1\nkey_2"></textarea>
+          </div>
+
+          <div class="full">
+            <label for="client_api_keys">Client API Keys（每行一个，可选）</label>
+            <textarea id="client_api_keys" placeholder="client_key_1\nclient_key_2"></textarea>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top: 14px;">
+          <button class="btn btn-primary" id="saveBtn">保存配置</button>
+          <button class="btn btn-secondary" id="reloadBtn">重新加载</button>
+          <button class="btn btn-danger" id="healthBtn">检查健康状态</button>
+        </div>
+
+        <div class="card" style="margin-top: 16px; background:#0d152b;">
+          <div style="font-weight: 600; margin-bottom: 8px;">运行状态</div>
+          <div class="kv mono" id="healthKV"></div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const statusEl = document.getElementById('status');
+      const healthKV = document.getElementById('healthKV');
+
+      const fields = {
+        admin_password: document.getElementById('admin_password'),
+        new_admin_password: document.getElementById('new_admin_password'),
+        onyx_base: document.getElementById('onyx_base'),
+        default_model: document.getElementById('default_model'),
+        default_persona: document.getElementById('default_persona'),
+        request_timeout_seconds: document.getElementById('request_timeout_seconds'),
+        onyx_keys: document.getElementById('onyx_keys'),
+        client_api_keys: document.getElementById('client_api_keys'),
+      };
+
+      function setStatus(type, msg) {
+        statusEl.className = 'status ' + type;
+        statusEl.textContent = msg;
+      }
+
+      function splitLines(text) {
+        return text
+          .split(/\r?\n/g)
+          .map(v => v.trim())
+          .filter(Boolean);
+      }
+
+      function fillForm(cfg) {
+        fields.onyx_base.value = cfg.onyx_base ?? '';
+        fields.default_model.value = cfg.default_model ?? '';
+        fields.default_persona.value = cfg.default_persona ?? 1;
+        fields.request_timeout_seconds.value = cfg.request_timeout_seconds ?? 300;
+        fields.onyx_keys.value = (cfg.onyx_keys || []).join('\n');
+        fields.client_api_keys.value = (cfg.client_api_keys || []).join('\n');
+      }
+
+      function readForm() {
+        return {
+          onyx_base: fields.onyx_base.value.trim(),
+          default_model: fields.default_model.value.trim(),
+          default_persona: Number(fields.default_persona.value || 1),
+          request_timeout_seconds: Number(fields.request_timeout_seconds.value || 300),
+          onyx_keys: splitLines(fields.onyx_keys.value),
+          client_api_keys: splitLines(fields.client_api_keys.value),
+          admin_password: fields.new_admin_password.value.trim() || null,
+        };
+      }
+
+      function adminHeaders() {
+        return {
+          'X-Admin-Password': fields.admin_password.value.trim(),
+        };
+      }
+
+      async function loadConfig() {
+        setStatus('warn', '正在加载配置...');
+        const resp = await fetch('/api/config', {
+          headers: adminHeaders(),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          const msg = data?.detail || data?.error || JSON.stringify(data);
+          setStatus('danger', '加载失败：' + msg);
+          return;
+        }
+        fillForm(data.config || {});
+        setStatus('ok', '配置已加载');
+      }
+
+      async function saveConfig() {
+        const payload = readForm();
+        setStatus('warn', '正在保存配置...');
+        const resp = await fetch('/api/config', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...adminHeaders(),
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          const msg = data?.detail || data?.error || JSON.stringify(data);
+          setStatus('danger', '保存失败：' + msg);
+          return;
+        }
+        fillForm(data.config || payload);
+        fields.new_admin_password.value = '';
+        setStatus('ok', '配置保存成功');
+      }
+
+      async function healthCheck() {
+        setStatus('warn', '正在检查健康状态...');
+        const resp = await fetch('/health');
+        const data = await resp.json();
+        if (!resp.ok) {
+          setStatus('danger', '健康检查失败');
+          return;
+        }
+        const rows = Object.entries(data).map(([k, v]) => `<div>${k}</div><div>${String(v)}</div>`);
+        healthKV.innerHTML = rows.join('');
+        setStatus('ok', '健康检查通过');
+      }
+
+      document.getElementById('saveBtn').addEventListener('click', saveConfig);
+      document.getElementById('reloadBtn').addEventListener('click', loadConfig);
+      document.getElementById('healthBtn').addEventListener('click', healthCheck);
+
+      loadConfig().then(healthCheck).catch(err => setStatus('danger', '初始化失败：' + err.message));
+    </script>
+  </body>
+</html>
