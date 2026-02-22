@@ -21,7 +21,7 @@ VERSION = "0.5.0-py"
 ONYX_BASE_DEFAULT = "https://cloud.onyx.app"
 MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 5, 10]
-RETRY_STATUS = {502, 503, 504, 429}
+RETRY_STATUS = {502, 503, 504, 429, 401, 403}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("onyx2api")
@@ -395,6 +395,10 @@ async def do_onyx_request(
             status = resp.status_code
             await resp.aclose()
             logger.warning("Onyx HTTP %s for model=%s: %s", status, model, body_text)
+            if "Error: An unexpected error occurred while processing your request. Please try again later." in body_text:
+                status = 503
+                logger.error("Onyx HTTP %s for model=%s: %s", status, model, body_text)
+
             if status in RETRY_STATUS and attempt < MAX_RETRIES:
                 wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
                 logger.warning("Attempt %s failed (HTTP %s), retry in %ss", attempt + 1, status, wait)
