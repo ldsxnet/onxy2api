@@ -42,7 +42,7 @@
 
     // 自动上报 API Key 到 onyx2api（app.py）
     APPEND_API_ENABLED: true,
-    APPEND_API_URL: 'http://127.0.0.1:19898/api/onyx-keys/append',
+    APPEND_API_URL: 'http://localhost:19898/api/onyx-keys/append',
     APPEND_API_ADMIN_PASSWORD: '',
     APPEND_API_TIMEOUT_MS: 15000,
     APPEND_API_MAX_RETRY: 3,
@@ -652,52 +652,62 @@
   }
 
   async function submitRegisterWithRetry(expectedEmail, onSuccess) {
+    const waitAttemptByUi = async (beforeHref, timeoutMs) => {
+      const start = Date.now();
+      let loaderSeen = false;
+
+      while (Date.now() - start < timeoutMs) {
+        const curHref = getCurrentHref();
+        const path = getCurrentPath();
+
+        const navigated = curHref !== beforeHref
+          || path.startsWith('/auth/waiting-on-verification')
+          || path.startsWith('/app')
+          || path.startsWith('/auth/verify-email');
+        if (navigated) {
+          return { ok: true, reason: 'navigated' };
+        }
+
+        const hasLoader = Boolean(document.querySelector('.loader'));
+        if (hasLoader) {
+          loaderSeen = true;
+        }
+
+        // 关键逻辑：出现过 loader，随后 loader 消失且页面未跳转 => 本次注册失败
+        if (loaderSeen && !hasLoader) {
+          await sleep(220);
+          const stillSamePage = getCurrentHref() === beforeHref && getCurrentPath().startsWith('/auth/signup');
+          if (stillSamePage) {
+            return { ok: false, reason: 'loader_disappeared_without_navigation' };
+          }
+        }
+
+        await sleep(120);
+      }
+
+      return { ok: false, reason: 'timeout' };
+    };
+
     for (let i = 0; i < CONFIG.MAX_REGISTER_RETRY; i += 1) {
       log(`提交注册 ${i + 1}/${CONFIG.MAX_REGISTER_RETRY}...`);
 
       const createBtn = findCreateAccountButton();
       if (!createBtn) throw new Error('未找到 Create Account 按钮');
 
-      const responsePromise = interceptNextRegisterResponse(CONFIG.REGISTER_TIMEOUT_MS);
+      const beforeHref = getCurrentHref();
       createBtn.click();
-      const response = await responsePromise;
 
-      if (!response) {
-        warn('未捕获到注册响应，重试');
-        await sleep(800);
-        continue;
-      }
-
-      if (response.status > 299) {
-        const textLower = String(response.text || '').toLowerCase();
-        warn(`注册失败: HTTP ${response.status}`);
-
-        if (textLower.includes('captcha')) {
-          throw new Error(`注册失败：captcha 校验失败。响应=${response.text}`);
+      const result = await waitAttemptByUi(beforeHref, CONFIG.REGISTER_TIMEOUT_MS);
+      if (result.ok) {
+        log(`注册成功（${result.reason}）`);
+        if (typeof onSuccess === 'function') {
+          onSuccess({ is_active: true, email: expectedEmail, detectedBy: result.reason });
         }
-
-        await sleep(1000 + randInt(0, 800));
-        continue;
+        return true;
       }
 
-      const data = safeJsonParse(response.text) || {};
-      if (!data.is_active) {
-        warn(`注册返回 is_active=false: ${response.text}`);
-        await sleep(1000 + randInt(0, 800));
-        continue;
-      }
-
-      if (String(data.email || '').toLowerCase() !== String(expectedEmail).toLowerCase()) {
-        warn(`注册返回邮箱不一致: expected=${expectedEmail}, got=${String(data.email || '')}`);
-        await sleep(1000 + randInt(0, 800));
-        continue;
-      }
-
-      log('注册成功');
-      if (typeof onSuccess === 'function') {
-        onSuccess(data);
-      }
-      return true;
+      warn(`注册失败，准备重试：${result.reason}`);
+      await sleep(1000 + randInt(0, 800));
     }
 
     throw new Error('注册失败：超过最大重试次数');
@@ -726,17 +736,44 @@
   }
 
   function extractApiKeyFromContainer(container) {
-    if (!container) return null;
-
     const tokenRegex = /on_tenant_[A-Za-z0-9._-]+/;
-    const text = String(container.textContent || '');
-    const textMatch = text.match(tokenRegex);
-    if (textMatch) return textMatch[0];
 
-    const fields = Array.from(container.querySelectorAll('input, textarea, code, pre'));
-    for (const field of fields) {
-      const value = String(field.value || field.textContent || '').trim();
-      const match = value.match(tokenRegex);
+    const scanNode = (node) => {
+      if (!node) return null;
+
+      const bodyNode = node.querySelector(".font-main-ui-body");
+      if (bodyNode) {
+        const bodyText = String(bodyNode.innerText || bodyNode.textContent || '');
+        const bodyMatch = bodyText.match(tokenRegex);
+        if (bodyMatch) return bodyMatch[0];
+      }
+
+      const text = String(node.textContent || '');
+      const textMatch = text.match(tokenRegex);
+      if (textMatch) return textMatch[0];
+
+      const fields = Array.from(node.querySelectorAll('input, textarea, code, pre, [data-testid], [class]'));
+      for (const field of fields) {
+        const value = String(field.value || field.innerText || field.textContent || '').trim();
+        const match = value.match(tokenRegex);
+        if (match) return match[0];
+      }
+
+      return null;
+    };
+
+    const direct = scanNode(container);
+    if (direct) return direct;
+
+    const dialogs = Array.from(document.querySelectorAll("[role='dialog']"));
+    for (const dlg of dialogs) {
+      const hit = scanNode(dlg);
+      if (hit) return hit;
+    }
+
+    const bodyFallback = document.querySelector("[role='dialog'] .font-main-ui-body");
+    if (bodyFallback) {
+      const match = String(bodyFallback.innerText || '').match(tokenRegex);
       if (match) return match[0];
     }
 
@@ -1238,10 +1275,55 @@
       createStartButton();
     };
 
+    const runStart = () => {
+      try {
+        start();
+      } catch (e) {
+        err('路由切换后执行 start 失败:', e);
+      }
+    };
+
+    let lastHref = getCurrentHref();
+    const onRouteMaybeChanged = (reason = 'unknown') => {
+      const href = getCurrentHref();
+      if (href === lastHref) return;
+      lastHref = href;
+      log(`检测到 SPA 路由变化(${reason}): ${href}`);
+      runStart();
+      setTimeout(runStart, 300);
+      setTimeout(runStart, 900);
+    };
+
+    const wrapHistoryMethod = (name) => {
+      const fn = history[name];
+      if (typeof fn !== 'function') return;
+      history[name] = function patchedHistory(...args) {
+        const result = fn.apply(this, args);
+        onRouteMaybeChanged(name);
+        return result;
+      };
+    };
+
+    wrapHistoryMethod('pushState');
+    wrapHistoryMethod('replaceState');
+    window.addEventListener('popstate', () => onRouteMaybeChanged('popstate'));
+    window.addEventListener('hashchange', () => onRouteMaybeChanged('hashchange'));
+
+    const ensureButtonsObserver = new MutationObserver(() => {
+      const path = getCurrentPath();
+      if (path.startsWith('/auth/signup') && !document.getElementById('onyx-auto-register-btn')) {
+        createStartButton();
+      }
+    });
+
     if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', start, { once: true });
+      document.addEventListener('DOMContentLoaded', () => {
+        runStart();
+        ensureButtonsObserver.observe(document.documentElement, { childList: true, subtree: true });
+      }, { once: true });
     } else {
-      start();
+      runStart();
+      ensureButtonsObserver.observe(document.documentElement, { childList: true, subtree: true });
     }
   }
 
