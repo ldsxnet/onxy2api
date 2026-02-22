@@ -75,6 +75,10 @@ class ConfigUpdate(BaseModel):
     admin_password: str | None = None
 
 
+class AppendOnyxKeyReq(BaseModel):
+    key: str = ""
+
+
 def generate_admin_password() -> str:
     return f"adm-{secrets.token_urlsafe(12)}"
 
@@ -139,6 +143,18 @@ class ConfigStore:
             self._cfg = cfg
             self.path.write_text(cfg.model_dump_json(indent=2), encoding="utf-8")
             return AppConfig(**cfg.model_dump())
+
+    def append_onyx_key(self, key: str) -> tuple[AppConfig, bool]:
+        with self._lock:
+            v = key.strip()
+            if not v:
+                raise ValueError("key 不能为空")
+            exists = v in self._cfg.onyx_keys
+            if not exists:
+                self._cfg.onyx_keys.append(v)
+                self._cfg = self._normalize(self._cfg)
+                self.path.write_text(self._cfg.model_dump_json(indent=2), encoding="utf-8")
+            return AppConfig(**self._cfg.model_dump()), (not exists)
 
 
 class ChatMsg(BaseModel):
@@ -1132,6 +1148,24 @@ async def save_config(payload: ConfigUpdate, request: Request) -> dict[str, Any]
     data = saved.model_dump()
     data.pop("admin_password", None)
     return {"ok": True, "config": data}
+
+
+@app.post("/api/onyx-keys/append")
+async def append_onyx_key(payload: AppendOnyxKeyReq, request: Request) -> dict[str, Any]:
+    cfg = await run_in_threadpool(store.get)
+    if not check_admin_auth(cfg, request):
+        raise HTTPException(status_code=401, detail="invalid admin password")
+
+    try:
+        saved, inserted = await run_in_threadpool(store.append_onyx_key, payload.key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "ok": True,
+        "inserted": inserted,
+        "total": len(saved.onyx_keys),
+    }
 
 
 @app.post("/v1/chat/completions")
