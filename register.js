@@ -1,15 +1,17 @@
 // ==UserScript==
 // @name         Onyx Auto Register (CF Temp Mail)
 // @namespace    https://tampermonkey.net/
-// @version      2026-02-22
-// @description  参考 register.py 的注册流程：自动创建临时邮箱、填写注册表单、重试提交、轮询验证邮件并自动跳转
+// @version      2026-02-25
+// @description  自动注册 + 邮箱验证 + 创建 Agent，并通过 GM_cookie 读取 fastapiusersauth 后上报到本地后端
 // @author       onxy2api
 // @match        https://cloud.onyx.app/auth/signup*
+// @match        https://cloud.onyx.app/auth/login*
 // @match        https://cloud.onyx.app/auth/waiting-on-verification*
 // @match        https://cloud.onyx.app/app*
 // @match        https://cloud.onyx.app/admin/api-key*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=onyx.app
 // @grant        GM_xmlhttpRequest
+// @grant        GM_cookie
 // @connect      *
 // @run-at       document-idle
 // ==/UserScript==
@@ -35,22 +37,24 @@
     MAIL_TIMEOUT_MS: 120000,
     MAIL_POLL_INTERVAL_MS: 3000,
     AGENT_TIMEOUT_MS: 120000,
-    API_KEY_TIMEOUT_MS: 120000,
+    COOKIE_WAIT_TIMEOUT_MS: 120000,
     PASSWORD_LENGTH: 16,
     AGENT_NAME_PREFIX: 'Test Agent',
     STATE_MAX_AGE_MS: 30 * 60 * 1000,
+    FULL_AUTO_RESTART_DELAY_MS: 1200,
 
-    // 自动上报 API Key 到 onyx2api（app.py）
-    APPEND_API_ENABLED: true,
-    APPEND_API_URL: 'http://localhost:19898/api/onyx-keys/append',
-    APPEND_API_ADMIN_PASSWORD: '',
-    APPEND_API_TIMEOUT_MS: 15000,
-    APPEND_API_MAX_RETRY: 3,
+    // 自动上报 fastapiusersauth Cookie 到 onyx2api（app.py）
+    APPEND_COOKIE_ENABLED: true,
+    APPEND_COOKIE_URL: 'http://127.0.0.1:19898/api/onyx-cookies/append',
+    APPEND_COOKIE_ADMIN_PASSWORD: '',
+    APPEND_COOKIE_TIMEOUT_MS: 15000,
+    APPEND_COOKIE_MAX_RETRY: 3,
   };
 
   const TAG = '[Onyx-AutoRegister]';
   const STORAGE_KEY = 'onyx_auto_register_state_v1';
   const LAST_ACCOUNT_KEY = 'onyx_last_registered_account';
+  const FULL_AUTO_ENABLED_KEY = 'onyx_full_auto_enabled_v1';
 
   function loadState() {
     try {
@@ -96,6 +100,24 @@
 
     window.localStorage.setItem(LAST_ACCOUNT_KEY, JSON.stringify(next));
     return next;
+  }
+
+  function loadFullAutoEnabled() {
+    try {
+      const raw = window.localStorage.getItem(FULL_AUTO_ENABLED_KEY);
+      return raw === '1' || String(raw).toLowerCase() === 'true';
+    } catch {
+      return false;
+    }
+  }
+
+  function saveFullAutoEnabled(enabled) {
+    window.localStorage.setItem(FULL_AUTO_ENABLED_KEY, enabled ? '1' : '0');
+    return enabled;
+  }
+
+  function isFullAutoEnabled() {
+    return loadFullAutoEnabled();
   }
 
   function maskEmail(email) {
@@ -206,45 +228,281 @@
     });
   }
 
-  async function appendApiKeyToServer(apiKey) {
-    if (!CONFIG.APPEND_API_ENABLED) {
-      log('已禁用 API Key 自动上报，跳过 append');
+  function getAppendCookieConfig() {
+    const enabled = Boolean(CONFIG.APPEND_COOKIE_ENABLED);
+    const url = String(CONFIG.APPEND_COOKIE_URL || '').trim();
+    const adminPassword = String(CONFIG.APPEND_COOKIE_ADMIN_PASSWORD || '').trim();
+    const timeout = Number(CONFIG.APPEND_COOKIE_TIMEOUT_MS || 15000);
+    const maxRetry = Math.max(1, Number(CONFIG.APPEND_COOKIE_MAX_RETRY || 1));
+
+    return {
+      enabled,
+      url,
+      adminPassword,
+      timeout,
+      maxRetry,
+    };
+  }
+
+  function gmCookieList(details) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_cookie === 'undefined' || !GM_cookie || typeof GM_cookie.list !== 'function') {
+        reject(new Error('GM_cookie 不可用：请确认脚本管理器支持并已授权 @grant GM_cookie'));
+        return;
+      }
+
+      try {
+        GM_cookie.list(details, (cookies, error) => {
+          if (error) {
+            reject(new Error(`GM_cookie.list 失败: ${String(error)}`));
+            return;
+          }
+          resolve(Array.isArray(cookies) ? cookies : []);
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  function gmCookieDelete(details) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_cookie === 'undefined' || !GM_cookie || typeof GM_cookie.delete !== 'function') {
+        reject(new Error('GM_cookie.delete 不可用：请确认脚本管理器支持并已授权 @grant GM_cookie'));
+        return;
+      }
+
+      try {
+        GM_cookie.delete(details, (error) => {
+          if (error) {
+            reject(new Error(`GM_cookie.delete 失败: ${String(error)}`));
+            return;
+          }
+          resolve(true);
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  function getDomainVariants(hostname) {
+    const host = String(hostname || '').trim().toLowerCase();
+    if (!host) return [];
+
+    const segments = host.split('.').filter(Boolean);
+    const out = new Set([host, `.${host}`]);
+
+    for (let i = 1; i < segments.length - 1; i += 1) {
+      const part = segments.slice(i).join('.');
+      out.add(part);
+      out.add(`.${part}`);
+    }
+
+    return Array.from(out);
+  }
+
+  function getPathVariants(pathname) {
+    const path = String(pathname || '/');
+    const out = new Set(['/']);
+
+    const chunks = path.split('/').filter(Boolean);
+    let cur = '';
+    for (const chunk of chunks) {
+      cur += `/${chunk}`;
+      out.add(cur);
+      out.add(`${cur}/`);
+    }
+
+    return Array.from(out);
+  }
+
+  function expireDocumentCookie(name, domain, path) {
+    const cookieName = encodeURIComponent(String(name || '').trim());
+    if (!cookieName) return;
+
+    const domainPart = domain ? `; domain=${domain}` : '';
+    const pathPart = path ? `; path=${path}` : '; path=/';
+    const expiresPart = '; expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0';
+
+    document.cookie = `${cookieName}=${expiresPart}${pathPart}${domainPart}`;
+    document.cookie = `${cookieName}=;${expiresPart}${pathPart}${domainPart}; Secure`;
+  }
+
+  async function clearAllCookiesForCurrentSite() {
+    const host = String(window.location.hostname || '').trim().toLowerCase();
+    const domainVariants = getDomainVariants(host);
+    const pathVariants = getPathVariants(window.location.pathname || '/');
+
+    // 先尝试 document.cookie 级别删除
+    const docCookies = String(document.cookie || '')
+      .split(';')
+      .map((part) => String(part || '').trim())
+      .filter(Boolean);
+
+    const docCookieNames = docCookies
+      .map((item) => item.split('=')[0])
+      .map((name) => decodeURIComponent(String(name || '').trim()))
+      .filter(Boolean);
+
+    for (const name of docCookieNames) {
+      for (const path of pathVariants) {
+        expireDocumentCookie(name, '', path);
+        for (const domain of domainVariants) {
+          expireDocumentCookie(name, domain, path);
+        }
+      }
+    }
+
+    // 再尝试 GM_cookie 级别删除（覆盖 HttpOnly 等）
+    let gmCookies = [];
+    try {
+      gmCookies = await gmCookieList({});
+    } catch (e) {
+      warn('清理 Cookie 时，GM_cookie.list 获取失败，将仅依赖 document.cookie 删除:', e);
+      gmCookies = [];
+    }
+
+    let gmDeleteSuccess = 0;
+    let gmDeleteFailed = 0;
+
+    const isDomainInCurrentSite = (domainLike) => {
+      const d = String(domainLike || '').trim().toLowerCase().replace(/^\./, '');
+      if (!d || !host) return false;
+      return d === host || host.endsWith(`.${d}`) || d.endsWith(`.${host}`);
+    };
+
+    for (const item of gmCookies) {
+      if (!item || typeof item !== 'object') continue;
+
+      const name = String(item.name || '').trim();
+      if (!name) continue;
+
+      const domain = String(item.domain || '').trim();
+      const path = String(item.path || '/').trim() || '/';
+      const urlHost = domain.replace(/^\./, '') || host;
+
+      if (!isDomainInCurrentSite(urlHost)) continue;
+
+      const candidates = [
+        { name, domain, path },
+        { name, url: `https://${urlHost}${path}` },
+        { name, url: `https://${urlHost}/` },
+      ];
+
+      let deleted = false;
+      for (const details of candidates) {
+        try {
+          await gmCookieDelete(details);
+          deleted = true;
+          break;
+        } catch {
+          // 尝试下一个候选
+        }
+      }
+
+      if (deleted) gmDeleteSuccess += 1;
+      else gmDeleteFailed += 1;
+    }
+
+    log(`Cookie 清理完成: document=${docCookieNames.length}, gm_deleted=${gmDeleteSuccess}, gm_failed=${gmDeleteFailed}`);
+    return { documentDeleted: docCookieNames.length, gmDeleteSuccess, gmDeleteFailed };
+  }
+
+  function scheduleFullAutoRestartToSignup() {
+    const target = 'https://cloud.onyx.app/auth/signup';
+    const delay = Math.max(200, Number(CONFIG.FULL_AUTO_RESTART_DELAY_MS || 1200));
+    log(`全自动模式：${delay}ms 后跳回注册页重新开始`);
+    setTimeout(() => {
+      window.location.href = target;
+    }, delay);
+  }
+
+  async function getFastapiUsersAuthCookieOnce() {
+    const queries = [
+      { url: 'https://cloud.onyx.app', name: 'fastapiusersauth' },
+      { domain: 'cloud.onyx.app', name: 'fastapiusersauth' },
+      { domain: '.onyx.app', name: 'fastapiusersauth' },
+      { name: 'fastapiusersauth' },
+      {},
+    ];
+
+    for (const q of queries) {
+      let items = [];
+      try {
+        items = await gmCookieList(q);
+      } catch {
+        continue;
+      }
+
+      const match = items.find((item) => {
+        if (!item || typeof item !== 'object') return false;
+        if (String(item.name || '') !== 'fastapiusersauth') return false;
+
+        const value = String(item.value || '').trim();
+        if (!value) return false;
+
+        const expiryMs = Number(item.expirationDate || 0) * 1000;
+        if (expiryMs > 0 && expiryMs <= Date.now()) return false;
+
+        return true;
+      });
+
+      if (match) {
+        return String(match.value || '').trim();
+      }
+    }
+
+    return '';
+  }
+
+  async function waitForFastapiUsersAuthCookie(timeoutMs = 120000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const value = await getFastapiUsersAuthCookieOnce();
+      if (value) return value;
+      await sleep(600);
+    }
+    return '';
+  }
+
+  async function appendCookieToServer(cookieValue) {
+    const appendCfg = getAppendCookieConfig();
+    if (!appendCfg.enabled) {
+      log('已禁用 Cookie 自动上报，跳过 append');
       return { ok: false, skipped: true, reason: 'disabled' };
     }
 
-    const key = String(apiKey || '').trim();
-    if (!key) {
-      throw new Error('append 失败：apiKey 为空');
+    const cookie = String(cookieValue || '').trim();
+    if (!cookie) {
+      throw new Error('append 失败：fastapiusersauth 为空');
     }
 
-    const url = String(CONFIG.APPEND_API_URL || '').trim();
-    const adminPassword = String(CONFIG.APPEND_API_ADMIN_PASSWORD || '').trim();
-    if (!url || !adminPassword) {
-      warn('未配置 APPEND_API_URL 或 APPEND_API_ADMIN_PASSWORD，跳过 append');
+    if (!appendCfg.url || !appendCfg.adminPassword) {
+      warn('未配置 APPEND_COOKIE_URL 或 APPEND_COOKIE_ADMIN_PASSWORD，跳过 append');
       return { ok: false, skipped: true, reason: 'missing_config' };
     }
 
-    const maxRetry = Math.max(1, Number(CONFIG.APPEND_API_MAX_RETRY || 1));
     let lastError = null;
 
-    for (let attempt = 1; attempt <= maxRetry; attempt += 1) {
+    for (let attempt = 1; attempt <= appendCfg.maxRetry; attempt += 1) {
       try {
         const resp = await gmRequest({
           method: 'POST',
-          url,
+          url: appendCfg.url,
           headers: {
             'Content-Type': 'application/json',
-            'x-admin-password': adminPassword,
+            'x-admin-password': appendCfg.adminPassword,
           },
-          data: JSON.stringify({ key }),
-          timeout: Number(CONFIG.APPEND_API_TIMEOUT_MS || 15000),
+          data: JSON.stringify({ cookie }),
+          timeout: appendCfg.timeout,
         });
 
         const bodyText = String(resp.responseText || '');
         const body = safeJsonParse(bodyText) || {};
 
         if (resp.status >= 200 && resp.status < 300 && body.ok === true) {
-          log(`API Key 已自动上报到服务器: inserted=${String(body.inserted)} total=${String(body.total)}`);
+          log(`Cookie 已自动上报到服务器: inserted=${String(body.inserted)} total=${String(body.total)}`);
           return {
             ok: true,
             inserted: Boolean(body.inserted),
@@ -255,14 +513,14 @@
         throw new Error(`HTTP ${resp.status}: ${bodyText}`);
       } catch (e) {
         lastError = e;
-        warn(`API Key 上报失败 ${attempt}/${maxRetry}:`, e);
-        if (attempt < maxRetry) {
+        warn(`Cookie 上报失败 ${attempt}/${appendCfg.maxRetry}:`, e);
+        if (attempt < appendCfg.maxRetry) {
           await sleep(800 + randInt(0, 700));
         }
       }
     }
 
-    throw new Error(`API Key 上报失败（重试耗尽）: ${String(lastError)}`);
+    throw new Error(`Cookie 上报失败（重试耗尽）: ${String(lastError)}`);
   }
 
   async function createTempEmail() {
@@ -662,6 +920,7 @@
 
         const navigated = curHref !== beforeHref
           || path.startsWith('/auth/waiting-on-verification')
+          || path.startsWith('/auth/login')
           || path.startsWith('/app')
           || path.startsWith('/auth/verify-email');
         if (navigated) {
@@ -713,6 +972,61 @@
     throw new Error('注册失败：超过最大重试次数');
   }
 
+  function inferPostVerifyPhaseByPath(path) {
+    const p = String(path || '');
+    if (p.startsWith('/admin/api-key')) return 'post_verify_reporting_cookie';
+    return 'post_verify_open_agent_page';
+  }
+
+  async function loginFromLoginPage(email, password) {
+    log('检测到跳转到登录页，尝试自动登录...');
+
+    const emailInput = await waitForElement("input[name='email']", 30000);
+    const passwordInput = await waitForElement("input[name='password']", 30000);
+    const submitBtn = await waitForCondition(() => {
+      const btn = document.querySelector("button[type='submit']");
+      return (btn && !btn.disabled) ? btn : null;
+    }, 30000, 180);
+
+    if (!emailInput || !passwordInput || !submitBtn) {
+      throw new Error('登录页自动登录失败：未找到 email/password/submit 元素');
+    }
+
+    await typeLikeHuman(emailInput, email, 40, 120);
+    await sleep(randInt(120, 320));
+    await typeLikeHuman(passwordInput, password, 50, 130);
+    await sleep(randInt(120, 320));
+
+    submitBtn.click();
+
+    const landingPath = await waitForCondition(() => {
+      const path = getCurrentPath();
+      if (
+        path.startsWith('/app')
+        || path.startsWith('/admin/api-key')
+        || path.startsWith('/auth/waiting-on-verification')
+        || path.startsWith('/auth/verify-email')
+      ) {
+        return path;
+      }
+      return null;
+    }, CONFIG.REGISTER_TIMEOUT_MS, 220);
+
+    if (!landingPath) {
+      throw new Error('登录页自动登录失败：提交后未跳转到预期页面');
+    }
+
+    if (landingPath.startsWith('/auth/waiting-on-verification') || landingPath.startsWith('/auth/verify-email')) {
+      log('登录后仍需邮箱验证，继续等待验证邮件流程');
+      return { requiresEmailVerification: true, landingPath };
+    }
+
+    const phase = inferPostVerifyPhaseByPath(landingPath);
+    saveState({ phase, email, password });
+    log(`登录成功并进入已激活路径: ${landingPath}`);
+    return { requiresEmailVerification: false, landingPath };
+  }
+
   function getCurrentPath() {
     return String(window.location.pathname || '');
   }
@@ -733,51 +1047,6 @@
     } catch {
       return null;
     }
-  }
-
-  function extractApiKeyFromContainer(container) {
-    const tokenRegex = /on_tenant_[A-Za-z0-9._-]+/;
-
-    const scanNode = (node) => {
-      if (!node) return null;
-
-      const bodyNode = node.querySelector(".font-main-ui-body");
-      if (bodyNode) {
-        const bodyText = String(bodyNode.innerText || bodyNode.textContent || '');
-        const bodyMatch = bodyText.match(tokenRegex);
-        if (bodyMatch) return bodyMatch[0];
-      }
-
-      const text = String(node.textContent || '');
-      const textMatch = text.match(tokenRegex);
-      if (textMatch) return textMatch[0];
-
-      const fields = Array.from(node.querySelectorAll('input, textarea, code, pre, [data-testid], [class]'));
-      for (const field of fields) {
-        const value = String(field.value || field.innerText || field.textContent || '').trim();
-        const match = value.match(tokenRegex);
-        if (match) return match[0];
-      }
-
-      return null;
-    };
-
-    const direct = scanNode(container);
-    if (direct) return direct;
-
-    const dialogs = Array.from(document.querySelectorAll("[role='dialog']"));
-    for (const dlg of dialogs) {
-      const hit = scanNode(dlg);
-      if (hit) return hit;
-    }
-
-    const bodyFallback = document.querySelector("[role='dialog'] .font-main-ui-body");
-    if (bodyFallback) {
-      const match = String(bodyFallback.innerText || '').match(tokenRegex);
-      if (match) return match[0];
-    }
-
-    return null;
   }
 
   async function createAgentOnCurrentPage(state) {
@@ -818,76 +1087,71 @@
     const assistantId = extractAssistantIdFromHref(successHref);
     saveLastRegisteredAccount({ agentName, assistantId: assistantId || null });
     saveState({
-      phase: 'post_verify_open_api_key_page',
+      phase: 'post_verify_reporting_cookie',
       agentName,
       assistantId: assistantId || null,
     });
 
     log(`Agent 创建成功: name=${agentName}, assistantId=${assistantId || 'unknown'}`);
-    window.location.href = 'https://cloud.onyx.app/admin/api-key';
+    await reportCookieOnCurrentPage({
+      ...state,
+      agentName,
+      assistantId: assistantId || null,
+    });
     return true;
   }
 
-  async function createApiKeyOnCurrentPage(state) {
-    log('开始创建 API Key...');
-    saveState({ phase: 'post_verify_creating_api_key' });
+  async function reportCookieOnCurrentPage(state) {
+    log('开始读取并上报 fastapiusersauth Cookie...');
+    saveState({ phase: 'post_verify_reporting_cookie' });
 
-    const openBtn = await waitForCondition(() => {
-      const byText = findButtonByText(['create api key', '新建 api key', '创建 api key']);
-      if (byText) return byText;
-      const fallback = document.querySelector("button[data-testid='create-api-key'], button[aria-label*='API Key']");
-      return (fallback && isVisible(fallback) && !fallback.disabled) ? fallback : null;
-    }, CONFIG.API_KEY_TIMEOUT_MS, 250);
-
-    if (!openBtn) {
-      throw new Error('创建 API Key 失败：未找到“Create API Key”按钮');
-    }
-    openBtn.click();
-    await sleep(randInt(180, 360));
-
-    const dialog = await waitForCondition(() => {
-      const nodes = Array.from(document.querySelectorAll("[role='dialog']"));
-      return nodes.find((n) => isVisible(n)) || null;
-    }, 20000, 160);
-
-    if (!dialog) {
-      throw new Error('创建 API Key 失败：未出现确认弹窗');
-    }
-
-    const confirmBtn = await waitForCondition(() => {
-      const inDialogExact = findButtonByText(['create', '创建'], { exact: true, scope: dialog });
-      if (inDialogExact) return inDialogExact;
-      return findButtonByText(['create'], { scope: dialog });
-    }, 20000, 180);
-
-    if (!confirmBtn) {
-      throw new Error('创建 API Key 失败：未找到弹窗内 Create 按钮');
-    }
-    confirmBtn.click();
-
-    const token = await waitForCondition(() => extractApiKeyFromContainer(dialog), CONFIG.API_KEY_TIMEOUT_MS, 250);
-    if (!token) {
-      throw new Error('创建 API Key 失败：未读取到 on_tenant_ token');
+    const cookieValue = await waitForFastapiUsersAuthCookie(CONFIG.COOKIE_WAIT_TIMEOUT_MS);
+    if (!cookieValue) {
+      throw new Error('未在超时时间内读取到 fastapiusersauth Cookie');
     }
 
     let appendResult = null;
     try {
-      appendResult = await appendApiKeyToServer(token);
+      appendResult = await appendCookieToServer(cookieValue);
     } catch (e) {
-      warn('API Key 自动上报失败（已创建本地 key）:', e);
+      warn('Cookie 自动上报失败（本地已读取到 cookie）:', e);
     }
 
     saveLastRegisteredAccount({
-      apiKey: token,
+      fastapiusersauth: cookieValue,
+      cookie: `fastapiusersauth=${cookieValue}`,
       agentName: state.agentName || null,
       assistantId: state.assistantId || null,
       appendResult,
       postVerifiedAt: Date.now(),
     });
 
-    saveState({ phase: 'post_verify_done', apiKey: token, appendResult, completedAt: Date.now() });
+    const appendSuccess = Boolean(appendResult && appendResult.ok === true);
+    const fullAutoEnabled = isFullAutoEnabled();
+
+    saveState({
+      phase: 'post_verify_done',
+      fastapiusersauth: cookieValue,
+      appendResult,
+      completedAt: Date.now(),
+      fullAutoEnabled,
+    });
+
+    if (appendSuccess && fullAutoEnabled) {
+      try {
+        await clearAllCookiesForCurrentSite();
+      } catch (e) {
+        warn('全自动模式：Cookie 清理失败，将继续跳回注册页:', e);
+      }
+
+      clearState();
+      log(`Cookie 上报成功，已进入全自动重启流程: ${cookieValue.slice(0, 12)}...`);
+      scheduleFullAutoRestartToSignup();
+      return true;
+    }
+
     clearState();
-    log(`API Key 创建成功: ${token.slice(0, 12)}...`);
+    log(`Cookie 上报流程完成: ${cookieValue.slice(0, 12)}...`);
     return true;
   }
 
@@ -897,6 +1161,8 @@
       'post_verify_pending',
       'post_verify_open_agent_page',
       'post_verify_creating_agent',
+      'post_verify_reporting_cookie',
+      // 兼容旧阶段名
       'post_verify_open_api_key_page',
       'post_verify_creating_api_key',
     ].includes(String(phase || ''));
@@ -928,7 +1194,7 @@
 
     if (!isPostVerifyPhase(state.phase)) {
       if (path.startsWith('/admin/api-key')) {
-        state = { ...state, phase: 'post_verify_creating_api_key' };
+        state = { ...state, phase: 'post_verify_reporting_cookie' };
       } else if (path.startsWith('/app/agents/create')) {
         state = { ...state, phase: 'post_verify_creating_agent' };
       } else if (path.startsWith('/app')) {
@@ -954,18 +1220,17 @@
         return true;
       }
 
-      if (state.phase === 'post_verify_open_api_key_page' || state.phase === 'post_verify_creating_api_key') {
-        if (!path.startsWith('/admin/api-key')) {
-          saveState({ phase: 'post_verify_open_api_key_page' });
-          window.location.href = 'https://cloud.onyx.app/admin/api-key';
-          return true;
-        }
-        await createApiKeyOnCurrentPage(state);
+      if (
+        state.phase === 'post_verify_reporting_cookie'
+        || state.phase === 'post_verify_open_api_key_page'
+        || state.phase === 'post_verify_creating_api_key'
+      ) {
+        await reportCookieOnCurrentPage(state);
         return true;
       }
 
       if (path.startsWith('/admin/api-key')) {
-        await createApiKeyOnCurrentPage(state);
+        await reportCookieOnCurrentPage(state);
         return true;
       }
 
@@ -1033,7 +1298,24 @@
       });
     });
 
-    // 5) 等待验证邮件并跳转
+    // 5) 处理提交后分支：
+    // - 正常：等待验证邮件并跳转
+    // - 异常但可利用：被直接跳到 /auth/login，则自动登录并继续后续流程
+    const currentPathAfterSubmit = getCurrentPath();
+    if (currentPathAfterSubmit.startsWith('/auth/login')) {
+      const loginResult = await loginFromLoginPage(email, password);
+      if (!loginResult.requiresEmailVerification) {
+        saveLastRegisteredAccount({
+          email,
+          password,
+          bypassedEmailVerification: true,
+          loginLandingPath: loginResult.landingPath,
+        });
+        await resumePostVerificationFromState('auto', { requireState: false });
+        return;
+      }
+    }
+
     saveState({ phase: 'waiting_email' });
     const authLink = await waitForVerificationEmail(cfToken, CONFIG.MAIL_TIMEOUT_MS);
     if (!authLink) {
@@ -1047,9 +1329,10 @@
       email,
       password,
       authLink,
+      bypassedEmailVerification: false,
     });
 
-    // 保留状态，验证成功后在 app 页面继续创建 Agent 与 API Key
+    // 保留状态，验证成功后在 app 页面继续创建 Agent 并上报 Cookie
     saveState({
       phase: 'verified_link_found',
       authLink,
@@ -1120,6 +1403,73 @@
     }
   }
 
+  async function startRegisterFlow(source = 'manual') {
+    if (running) return false;
+
+    const btn = document.getElementById('onyx-auto-register-btn');
+    running = true;
+
+    if (btn) {
+      btn.disabled = true;
+      btn.style.opacity = '0.8';
+      btn.style.cursor = 'not-allowed';
+      btn.textContent = source === 'full_auto' ? '全自动执行中...' : '注册中...';
+    }
+
+    try {
+      await run();
+      if (btn) btn.textContent = '已提交，跳转验证中...';
+      return true;
+    } catch (e) {
+      err('自动注册失败:', e);
+      running = false;
+      if (btn) {
+        btn.disabled = false;
+        btn.style.opacity = '1';
+        btn.style.cursor = 'pointer';
+        btn.textContent = '开始注册';
+      }
+      return false;
+    }
+  }
+
+  function createFullAutoToggleButton() {
+    if (document.getElementById('onyx-full-auto-toggle-btn')) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'onyx-full-auto-toggle-btn';
+    btn.type = 'button';
+    btn.style.position = 'fixed';
+    btn.style.top = '16px';
+    btn.style.left = '16px';
+    btn.style.zIndex = '999999';
+    btn.style.padding = '10px 14px';
+    btn.style.border = 'none';
+    btn.style.borderRadius = '8px';
+    btn.style.color = '#fff';
+    btn.style.fontSize = '14px';
+    btn.style.fontWeight = '600';
+    btn.style.cursor = 'pointer';
+    btn.style.boxShadow = '0 4px 12px rgba(0,0,0,.25)';
+
+    const render = () => {
+      const enabled = isFullAutoEnabled();
+      btn.textContent = enabled ? '全自动循环：开' : '全自动循环：关';
+      btn.style.background = enabled ? '#0f766e' : '#6b7280';
+    };
+
+    btn.addEventListener('click', () => {
+      const next = !isFullAutoEnabled();
+      saveFullAutoEnabled(next);
+      render();
+      log(`全自动循环已${next ? '启用' : '关闭'}`);
+    });
+
+    render();
+    document.body.appendChild(btn);
+    log('已注入“全自动循环”按钮');
+  }
+
   function createStartButton() {
     if (document.getElementById('onyx-auto-register-btn')) return;
 
@@ -1142,24 +1492,7 @@
     btn.style.boxShadow = '0 4px 12px rgba(0,0,0,.25)';
 
     btn.addEventListener('click', async () => {
-      if (running) return;
-      running = true;
-      btn.disabled = true;
-      btn.style.opacity = '0.8';
-      btn.style.cursor = 'not-allowed';
-      btn.textContent = '注册中...';
-
-      try {
-        await run();
-        btn.textContent = '已提交，跳转验证中...';
-      } catch (e) {
-        err('自动注册失败:', e);
-        running = false;
-        btn.disabled = false;
-        btn.style.opacity = '1';
-        btn.style.cursor = 'pointer';
-        btn.textContent = '开始注册';
-      }
+      await startRegisterFlow('manual');
     });
 
     document.body.appendChild(btn);
@@ -1212,7 +1545,7 @@
 
     const btn = document.createElement('button');
     btn.id = 'onyx-auto-postverify-btn';
-    btn.textContent = '继续创建 Agent/API Key';
+    btn.textContent = '继续创建 Agent/上报Cookie';
     btn.type = 'button';
     btn.style.position = 'fixed';
     btn.style.top = '16px';
@@ -1240,17 +1573,19 @@
         btn.disabled = false;
         btn.style.opacity = '1';
         btn.style.cursor = 'pointer';
-        btn.textContent = '继续创建 Agent/API Key';
+        btn.textContent = '继续创建 Agent/上报Cookie';
       }
     });
 
     document.body.appendChild(btn);
-    log('已注入“继续创建 Agent/API Key”按钮');
+    log('已注入“继续创建 Agent/上报Cookie”按钮');
   }
 
   function bootstrap() {
     const start = () => {
       const path = window.location.pathname;
+      createFullAutoToggleButton();
+
       const isWaitingPage = path.startsWith('/auth/waiting-on-verification');
       if (isWaitingPage) {
         createResumeButton();
@@ -1273,6 +1608,13 @@
       }
 
       createStartButton();
+
+      const isSignupPage = path.startsWith('/auth/signup');
+      if (isSignupPage && isFullAutoEnabled()) {
+        setTimeout(() => {
+          startRegisterFlow('full_auto').catch((e) => err('全自动启动失败:', e));
+        }, 260);
+      }
     };
 
     const runStart = () => {

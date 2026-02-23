@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 import threading
 import time
@@ -14,14 +15,20 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 VERSION = "0.5.0-py"
-ONYX_BASE_DEFAULT = "https://cloud.onyx.app"
+ONYX_BASE_URL = os.getenv("ONYX_BASE_URL", "https://cloud.onyx.app").rstrip("/")
+ONYX_AUTH_COOKIE = os.getenv("ONYX_AUTH_COOKIE", "")
+ONYX_PERSONA_ID = int(os.getenv("ONYX_PERSONA_ID", "0"))
+ONYX_ORIGIN = os.getenv("ONYX_ORIGIN", "webapp")
+ONYX_REFERER = os.getenv("ONYX_REFERER", "https://cloud.onyx.app/app")
+ONYX_BASE_DEFAULT = ONYX_BASE_URL
 MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 5, 10]
 RETRY_STATUS = {502, 503, 504, 429, 401, 403}
+ONYX_COOKIE_ERROR_LIMIT = max(int(os.getenv("ONYX_COOKIE_ERROR_LIMIT", "3")), 1)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("onyx2api")
@@ -34,49 +41,47 @@ class ProviderModel:
 
 
 MODEL_MAP: dict[str, ProviderModel] = {
-    "claude-opus-4-6": ProviderModel("Anthropic", "claude-opus-4-6"),
-    "claude-opus-4-5": ProviderModel("Anthropic", "claude-opus-4-5"),
-    "claude-sonnet-4-6": ProviderModel("Anthropic", "claude-sonnet-4-6"),
-    "claude-sonnet-4-5": ProviderModel("Anthropic", "claude-sonnet-4-5"),
-    "claude-sonnet-4": ProviderModel("Anthropic", "claude-sonnet-4-20250514"),
-    "claude-3-5-sonnet": ProviderModel("Anthropic", "claude-3-5-sonnet-20241022"),
-    "claude-3-5-haiku": ProviderModel("Anthropic", "claude-3-5-haiku-20241022"),
-    "claude-3-opus": ProviderModel("Anthropic", "claude-3-opus-20240229"),
-    "claude-haiku-4-5": ProviderModel("Anthropic", "claude-haiku-4-5"),
+    "claude-opus-4.6": ProviderModel("Anthropic", "claude-opus-4-6"),
+    "claude-opus-4.5": ProviderModel("Anthropic", "claude-opus-4-5"),
+    "claude-sonnet-4.5": ProviderModel("Anthropic", "claude-sonnet-4-5"),
+    "gpt-5.2": ProviderModel("OpenAI", "gpt-5.2"),
+    "gpt-5-mini": ProviderModel("OpenAI", "gpt-5-mini"),
+    "gpt-4.1": ProviderModel("OpenAI", "gpt-4.1"),
     "gpt-4o": ProviderModel("OpenAI", "gpt-4o"),
-    "gpt-4o-mini": ProviderModel("OpenAI", "gpt-4o-mini"),
-    "gpt-4-turbo": ProviderModel("OpenAI", "gpt-4-turbo"),
-    "gpt-4": ProviderModel("OpenAI", "gpt-4"),
-    "o1": ProviderModel("OpenAI", "o1"),
-    "o1-mini": ProviderModel("OpenAI", "o1-mini"),
-    "o3-mini": ProviderModel("OpenAI", "o3-mini"),
-    "gemini-2.0-flash": ProviderModel("Google", "gemini-2.0-flash"),
-    "gemini-2.5-pro": ProviderModel("Google", "gemini-2.5-pro-preview-05-06"),
+    "o3": ProviderModel("OpenAI", "o3"),
 }
 
 
 class AppConfig(BaseModel):
     onyx_base: str = ONYX_BASE_DEFAULT
-    onyx_keys: list[str] = Field(default_factory=list)
+    onyx_cookies: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("onyx_cookies", "onyx_keys"),
+        serialization_alias="onyx_cookies",
+    )
     client_api_keys: list[str] = Field(default_factory=list)
-    default_persona: int = 1
-    default_model: str = "claude-opus-4-6"
+    default_persona: int = ONYX_PERSONA_ID if ONYX_PERSONA_ID > 0 else 1
+    default_model: str = "claude-opus-4.6"
     request_timeout_seconds: int = 300
     admin_password: str = ""
 
 
 class ConfigUpdate(BaseModel):
     onyx_base: str = ONYX_BASE_DEFAULT
-    onyx_keys: list[str] = Field(default_factory=list)
+    onyx_cookies: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("onyx_cookies", "onyx_keys"),
+        serialization_alias="onyx_cookies",
+    )
     client_api_keys: list[str] = Field(default_factory=list)
-    default_persona: int = 1
-    default_model: str = "claude-opus-4-6"
+    default_persona: int = ONYX_PERSONA_ID if ONYX_PERSONA_ID > 0 else 1
+    default_model: str = "claude-opus-4.6"
     request_timeout_seconds: int = 300
     admin_password: str | None = None
 
 
-class AppendOnyxKeyReq(BaseModel):
-    key: str = ""
+class AppendOnyxCookieReq(BaseModel):
+    cookie: str = Field(default="", validation_alias=AliasChoices("cookie", "key"), serialization_alias="cookie")
 
 
 def generate_admin_password() -> str:
@@ -102,16 +107,16 @@ class ConfigStore:
         return out
 
     def _normalize(self, cfg: AppConfig) -> AppConfig:
-        cfg.onyx_keys = self._norm_keys(cfg.onyx_keys)
+        cfg.onyx_cookies = self._norm_keys(cfg.onyx_cookies)
         cfg.client_api_keys = self._norm_keys(cfg.client_api_keys)
-        if cfg.client_api_keys and not cfg.onyx_keys:
-            raise ValueError("client_api_keys 已配置时，onyx_keys 不能为空")
+        if cfg.client_api_keys and not cfg.onyx_cookies:
+            raise ValueError("client_api_keys 已配置时，onyx_cookies 不能为空")
         if cfg.default_persona <= 0:
             cfg.default_persona = 1
         if cfg.request_timeout_seconds < 30:
             cfg.request_timeout_seconds = 30
         if not cfg.default_model.strip():
-            cfg.default_model = "claude-opus-4-6"
+            cfg.default_model = "claude-opus-4.6"
         if not cfg.onyx_base.strip():
             cfg.onyx_base = ONYX_BASE_DEFAULT
         if not cfg.admin_password.strip():
@@ -144,14 +149,14 @@ class ConfigStore:
             self.path.write_text(cfg.model_dump_json(indent=2), encoding="utf-8")
             return AppConfig(**cfg.model_dump())
 
-    def append_onyx_key(self, key: str) -> tuple[AppConfig, bool]:
+    def append_onyx_cookie(self, cookie: str) -> tuple[AppConfig, bool]:
         with self._lock:
-            v = key.strip()
+            v = cookie.strip()
             if not v:
-                raise ValueError("key 不能为空")
-            exists = v in self._cfg.onyx_keys
+                raise ValueError("cookie 不能为空")
+            exists = v in self._cfg.onyx_cookies
             if not exists:
-                self._cfg.onyx_keys.append(v)
+                self._cfg.onyx_cookies.append(v)
                 self._cfg = self._normalize(self._cfg)
                 self.path.write_text(self._cfg.model_dump_json(indent=2), encoding="utf-8")
             return AppConfig(**self._cfg.model_dump()), (not exists)
@@ -220,8 +225,10 @@ async def on_shutdown() -> None:
     if http is not None:
         await http.aclose()
 
-_key_lock = threading.Lock()
-_key_index = 0
+_cookie_lock = threading.Lock()
+_cookie_index = 0
+_cookie_error_lock = threading.Lock()
+_cookie_error_counts: dict[str, int] = {}
 
 
 class OnyxHTTPError(Exception):
@@ -246,25 +253,140 @@ def extract_token(value: str | None) -> str:
     return s
 
 
-def next_key(keys: list[str]) -> str:
-    global _key_index
-    if not keys:
+def extract_cookie_source(value: str | None) -> str:
+    if not value:
         return ""
-    with _key_lock:
-        idx = _key_index % len(keys)
-        _key_index += 1
-    return keys[idx]
+    s = value.strip()
+    if not s:
+        return ""
+    if s.lower().startswith("bearer "):
+        return s[7:].strip()
+    return s
 
 
-def resolve_auth(cfg: AppConfig, *headers: str | None) -> str:
-    if cfg.onyx_keys:
-        return next_key(cfg.onyx_keys)
+def _extract_auth_value(cookie_str: str) -> str:
+    # 兼容完整 Cookie 串或仅 fastapiusersauth 的值
+    if "fastapiusersauth=" in cookie_str:
+        for piece in cookie_str.split(";"):
+            piece = piece.strip()
+            if piece.startswith("fastapiusersauth="):
+                return piece.split("=", 1)[1]
+    return cookie_str.strip()
+
+
+def _cookie_error_identifier(cookie_str: str) -> str:
+    return _extract_auth_value(cookie_str).strip()
+
+
+def build_onyx_headers(cfg: AppConfig, with_json: bool = False) -> dict[str, str]:
+    base = cfg.onyx_base.rstrip("/")
+    headers = {
+        "accept": "application/json",
+        "origin": base,
+        "referer": ONYX_REFERER,
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
+        ),
+    }
+    if with_json:
+        headers["content-type"] = "application/json"
+    return headers
+
+
+def next_cookie(cookies: list[str]) -> str:
+    global _cookie_index
+    if not cookies:
+        return ""
+    with _cookie_lock:
+        idx = _cookie_index % len(cookies)
+        _cookie_index += 1
+    return cookies[idx]
+
+
+def clear_cookie_error_count(cookie_str: str) -> None:
+    cookie_id = _cookie_error_identifier(cookie_str)
+    if not cookie_id:
+        return
+    with _cookie_error_lock:
+        _cookie_error_counts.pop(cookie_id, None)
+
+
+async def mark_cookie_error(cfg: AppConfig, cookie_str: str, reason: str) -> None:
+    cookie_id = _cookie_error_identifier(cookie_str)
+    if not cookie_id:
+        return
+
+    with _cookie_error_lock:
+        fail_count = _cookie_error_counts.get(cookie_id, 0) + 1
+        _cookie_error_counts[cookie_id] = fail_count
+
+    logger.warning(
+        "Cookie auth failed (%s/%s): %s",
+        fail_count,
+        ONYX_COOKIE_ERROR_LIMIT,
+        reason,
+    )
+
+    if fail_count < ONYX_COOKIE_ERROR_LIMIT:
+        return
+
+    if not cfg.onyx_cookies:
+        return
+
+    cur_cfg = await run_in_threadpool(store.get)
+    if not cur_cfg.onyx_cookies:
+        return
+
+    target = cookie_str.strip()
+    target_auth = _extract_auth_value(cookie_str)
+    kept_cookies: list[str] = []
+    removed_count = 0
+
+    for item in cur_cfg.onyx_cookies:
+        item_auth = _extract_auth_value(item)
+        if item == target or (target_auth and item_auth == target_auth):
+            removed_count += 1
+            continue
+        kept_cookies.append(item)
+
+    if removed_count <= 0:
+        return
+
+    cur_cfg.onyx_cookies = kept_cookies
+    try:
+        saved_cfg = await run_in_threadpool(store.set, cur_cfg)
+    except ValueError as exc:
+        logger.error("Cookie reached error limit but cannot be removed: %s", exc)
+        return
+
+    cfg.onyx_cookies = saved_cfg.onyx_cookies
+    with _cookie_lock:
+        if cfg.onyx_cookies:
+            _cookie_index %= len(cfg.onyx_cookies)
+        else:
+            _cookie_index = 0
+
+    with _cookie_error_lock:
+        _cookie_error_counts.pop(cookie_id, None)
+
+    logger.error(
+        "Removed invalid Onyx cookie after %s failures, remaining cookies=%s",
+        fail_count,
+        len(cfg.onyx_cookies),
+    )
+
+
+def resolve_auth_cookie(cfg: AppConfig, *headers: str | None) -> str:
+    if cfg.onyx_cookies:
+        return next_cookie(cfg.onyx_cookies)
     for h in headers:
-        token = extract_token(h)
-        if token:
-            return token
+        cookie_src = extract_cookie_source(h)
+        if cookie_src:
+            return cookie_src
+    if ONYX_AUTH_COOKIE:
+        return ONYX_AUTH_COOKIE
     return ""
-
 
 def check_client_auth(cfg: AppConfig, request: Request) -> bool:
     if not cfg.client_api_keys:
@@ -355,9 +477,32 @@ def messages_to_onyx(system: str, msgs: list[ChatMsg]) -> str:
     return "\n".join(out).strip()
 
 
+async def create_chat_session(cfg: AppConfig, auth_cookie: str, persona: int) -> str:
+    if http is None:
+        raise RuntimeError("HTTP client is not initialized")
+
+    response = await http.post(
+        f"{cfg.onyx_base.rstrip('/')}/api/chat/create-chat-session",
+        headers=build_onyx_headers(cfg, with_json=True),
+        json={"persona_id": persona, "description": None, "project_id": None},
+        cookies={"fastapiusersauth": _extract_auth_value(auth_cookie)},
+        timeout=httpx.Timeout(float(cfg.request_timeout_seconds), connect=30.0),
+    )
+    if response.status_code == 401:
+        raise RuntimeError("Onyx auth failed - check onyx cookie")
+    if response.status_code != 200:
+        raise RuntimeError(f"Onyx create-chat-session HTTP {response.status_code}: {response.text[:300]}")
+
+    data = response.json()
+    chat_session_id = data.get("chat_session_id") or data.get("id")
+    if not chat_session_id:
+        raise RuntimeError(f"create-chat-session missing chat_session_id: {data}")
+    return str(chat_session_id)
+
+
 async def do_onyx_request(
     cfg: AppConfig,
-    token: str,
+    auth_cookie: str,
     model: str,
     msgs: list[ChatMsg],
     system: str,
@@ -367,65 +512,83 @@ async def do_onyx_request(
     if http is None:
         raise RuntimeError("HTTP client is not initialized")
 
-    body = {
-        "message": messages_to_onyx(system, msgs),
-        "chat_session_info": {"persona_id": persona},
-        "llm_override": build_llm_override(model, temp),
-        "stream": True,
-        "file_descriptors": [],
-        "deep_research": False,
-        "origin": "api",
-    }
-
+    total_cookies = max(len(cfg.onyx_cookies), 1)
+    max_attempts = total_cookies * MAX_RETRIES
     last_err: Exception | None = None
-    for attempt in range(MAX_RETRIES + 1):
-        cur = token
-        if attempt > 0 and cfg.onyx_keys:
-            cur = next_key(cfg.onyx_keys)
-            logger.warning("Retry %s/%s, switched key", attempt, MAX_RETRIES)
+
+    for attempt in range(max_attempts):
+        current_total = max(len(cfg.onyx_cookies), 1)
+        cur_cookie = auth_cookie if attempt == 0 else (next_cookie(cfg.onyx_cookies) if cfg.onyx_cookies else auth_cookie)
+        cookie_idx = attempt % current_total
+        round_num = attempt // current_total
+
+        if attempt > 0:
+            logger.warning(
+                "Retry %s/%s (cookie %s/%s, round %s), switching cookie",
+                attempt,
+                max_attempts,
+                cookie_idx + 1,
+                current_total,
+                round_num + 1,
+            )
 
         try:
+            chat_session_id = await create_chat_session(cfg, cur_cookie, persona)
+            body = {
+                "message": messages_to_onyx(system, msgs),
+                "chat_session_id": chat_session_id,
+                "parent_message_id": None,
+                "file_descriptors": [],
+                "internal_search_filters": {
+                    "source_type": None,
+                    "document_set": None,
+                    "time_cutoff": None,
+                    "tags": [],
+                },
+                "deep_research": False,
+                "forced_tool_id": None,
+                "llm_override": build_llm_override(model, temp),
+                "origin": ONYX_ORIGIN,
+            }
+
             req = http.build_request(
                 "POST",
                 f"{cfg.onyx_base.rstrip('/')}/api/chat/send-chat-message",
                 json=body,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {cur}",
-                },
+                headers=build_onyx_headers(cfg, with_json=True),
+                cookies={"fastapiusersauth": _extract_auth_value(cur_cookie)},
                 timeout=httpx.Timeout(float(cfg.request_timeout_seconds), connect=30.0),
             )
             resp = await http.send(req, stream=True)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, RuntimeError) as exc:
             last_err = exc
-            if attempt < MAX_RETRIES:
-                wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-                logger.warning("Attempt %s failed (%s), retry in %ss", attempt + 1, exc, wait)
-                await asyncio.sleep(wait)
-                continue
-            break
+            await mark_cookie_error(cfg, cur_cookie, str(exc))
+            wait = RETRY_BACKOFF[min(round_num, len(RETRY_BACKOFF) - 1)]
+            logger.warning("Attempt %s failed (%s), retry in %ss", attempt + 1, exc, wait)
+            await asyncio.sleep(wait)
+            continue
 
         if resp.status_code != 200:
             body_bytes = await resp.aread()
             body_text = body_bytes.decode("utf-8", errors="ignore")[:1024]
             status = resp.status_code
             await resp.aclose()
-            logger.warning("Onyx HTTP %s for model=%s: %s", status, model, body_text)
-            if "Error: An unexpected error occurred while processing your request. Please try again later." in body_text:
+            logger.warning("Onyx HTTP %s for model=%s (cookie %s/%s): %s", status, model, cookie_idx + 1, current_total, body_text)
+
+            if "unexpected error" in body_text.lower() or "try again later" in body_text.lower():
                 status = 503
-                logger.error("Onyx HTTP %s for model=%s: %s", status, model, body_text)
 
-            if status in RETRY_STATUS and attempt < MAX_RETRIES:
-                wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
-                logger.warning("Attempt %s failed (HTTP %s), retry in %ss", attempt + 1, status, wait)
-                await asyncio.sleep(wait)
-                continue
-            raise OnyxHTTPError(status, body_text)
+            last_err = OnyxHTTPError(status, body_text)
+            await mark_cookie_error(cfg, cur_cookie, f"HTTP {status}")
+            wait = RETRY_BACKOFF[min(round_num, len(RETRY_BACKOFF) - 1)]
+            logger.warning("Attempt %s failed (HTTP %s), trying next cookie in %ss", attempt + 1, status, wait)
+            await asyncio.sleep(wait)
+            continue
 
+        clear_cookie_error_count(cur_cookie)
         return resp
 
-    raise RuntimeError(f"all retries failed: {last_err}")
-
+    raise last_err if last_err is not None else RuntimeError("all retries failed")
 
 async def iter_onyx_events(resp: httpx.Response) -> AsyncIterator[dict[str, Any]]:
     async for line in resp.aiter_lines():
@@ -446,6 +609,77 @@ async def iter_onyx_events(resp: httpx.Response) -> AsyncIterator[dict[str, Any]
             continue
         yield {"type": str(obj.get("type", "")), "err": "", "obj": obj}
 
+
+
+
+async def safe_iter_onyx_events(
+    cfg: AppConfig,
+    auth_cookie: str,
+    model: str,
+    msgs: list[ChatMsg],
+    system: str,
+    temp: float,
+    persona: int,
+) -> AsyncIterator[tuple[httpx.Response, AsyncIterator[dict[str, Any]]]]:
+    """包装 iter_onyx_events，遇到流式错误自动换 cookie 重试"""
+    total_cookies = max(len(cfg.onyx_cookies), 1)
+    max_stream_retries = total_cookies * 2
+
+    for stream_attempt in range(max_stream_retries):
+        cur_cookie = auth_cookie if stream_attempt == 0 else (next_cookie(cfg.onyx_cookies) if cfg.onyx_cookies else auth_cookie)
+
+        try:
+            resp = await do_onyx_request(
+                cfg,
+                cur_cookie,
+                model,
+                msgs,
+                system,
+                temp,
+                cfg.default_persona if persona is None else persona,
+            )
+        except Exception as exc:
+            logger.error("do_onyx_request failed on stream attempt %s: %s", stream_attempt + 1, exc)
+            if stream_attempt < max_stream_retries - 1:
+                await asyncio.sleep(2)
+                continue
+            raise
+
+        has_error = False
+        error_msg = ""
+
+        async def checked_events() -> AsyncIterator[dict[str, Any]]:
+            nonlocal has_error, error_msg
+            async for ev in iter_onyx_events(resp):
+                if ev.get("err"):
+                    has_error = True
+                    error_msg = ev["err"]
+                    logger.error("Stream error on attempt %s: %s", stream_attempt + 1, error_msg)
+                    return
+                etype = ev.get("type", "")
+                obj = ev.get("obj", {})
+                if etype == "error":
+                    has_error = True
+                    error_msg = str(obj.get("error", "Unknown error"))
+                    logger.error("Stream error event on attempt %s: %s", stream_attempt + 1, error_msg)
+                    return
+                yield ev
+
+        yield resp, checked_events()
+
+        if not has_error:
+            return
+
+        await resp.aclose()
+        logger.warning(
+            "Stream had error, retrying with next cookie (%s/%s): %s",
+            stream_attempt + 1,
+            max_stream_retries,
+            error_msg,
+        )
+        await asyncio.sleep(2)
+
+    raise RuntimeError("All stream retry attempts failed")
 
 def sse(data: Any) -> bytes:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
@@ -483,9 +717,8 @@ async def stream_openai(resp: httpx.Response, model: str, rid: str) -> AsyncIter
         obj = ev["obj"]
 
         if ev["err"]:
-            yield sse(make_chunk(rid, created, model, {"content": f"\n\n[Error: {ev['err']}]"}, "stop"))
-            yield b"data: [DONE]\n\n"
-            return
+            logger.error("Stream error (skipped, not sent to client): %s", ev["err"])
+            continue
 
         if etype in {"reasoning_start", "reasoning_done", "image_generation_heartbeat"}:
             continue
@@ -664,9 +897,8 @@ async def stream_openai(resp: httpx.Response, model: str, rid: str) -> AsyncIter
 
         if etype == "error":
             msg = obj.get("error") if isinstance(obj.get("error"), str) else "Unknown error"
-            yield sse(make_chunk(rid, created, model, {"content": f"\n[Error: {msg}]"}, "stop"))
-            yield b"data: [DONE]\n\n"
-            return
+            logger.error("Stream event error (skipped, not sent to client): %s", msg)
+            continue
 
         if etype == "stop":
             yield sse(make_chunk(rid, created, model, {}, "stop"))
@@ -684,8 +916,8 @@ async def collect_openai(resp: httpx.Response) -> str:
         etype = ev["type"]
         obj = ev["obj"]
         if ev["err"]:
-            parts.append(f"\n[Error: {ev['err']}]")
-            break
+            logger.error("Collect error (skipped): %s", ev["err"])
+            continue
 
         if etype == "message_delta":
             c = obj.get("content")
@@ -738,7 +970,8 @@ async def collect_openai(resp: httpx.Response) -> str:
                 tool_ctx.append(str(data))
         elif etype == "error":
             msg = obj.get("error") if isinstance(obj.get("error"), str) else "Unknown error"
-            parts.append(f"\n[Error: {msg}]")
+            logger.error("Collect event error (skipped): %s", msg)
+            continue
         elif etype == "stop":
             break
 
@@ -794,18 +1027,8 @@ async def stream_anthropic(resp: httpx.Response, model: str, rid: str) -> AsyncI
         obj = ev["obj"]
 
         if ev["err"]:
-            if not in_text:
-                yield start_block("text")
-                in_text = True
-            yield anthropic_sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "text_delta", "text": f"\n[Error: {ev['err']}]"},
-                },
-            )
-            break
+            logger.error("Anthropic stream error (skipped): %s", ev["err"])
+            continue
 
         if etype == "reasoning_start":
             if not in_thinking:
@@ -988,8 +1211,8 @@ async def collect_anthropic(resp: httpx.Response) -> tuple[str, str]:
         obj = ev["obj"]
 
         if ev["err"]:
-            text_parts.append(f"\n[Error: {ev['err']}]")
-            break
+            logger.error("Anthropic collect error (skipped): %s", ev["err"])
+            continue
 
         if etype == "reasoning_delta":
             s = obj.get("reasoning")
@@ -1080,7 +1303,7 @@ async def handle_health() -> dict[str, Any]:
     return {
         "status": "ok",
         "version": VERSION,
-        "keys": len(cfg.onyx_keys),
+        "cookies": len(cfg.onyx_cookies),
         "client_keys": len(cfg.client_api_keys),
         "onyx_base": cfg.onyx_base,
     }
@@ -1088,22 +1311,7 @@ async def handle_health() -> dict[str, Any]:
 
 @app.get("/v1/models")
 async def handle_models() -> dict[str, Any]:
-    models = [
-        "claude-opus-4-6",
-        "claude-opus-4-5",
-        "claude-sonnet-4-6",
-        "claude-sonnet-4-5",
-        "claude-sonnet-4",
-        "claude-3-5-sonnet",
-        "claude-3-5-haiku",
-        "claude-haiku-4-5",
-        "gpt-4o",
-        "gpt-4o-mini",
-        "o1",
-        "o3-mini",
-        "gemini-2.0-flash",
-        "gemini-2.5-pro",
-    ]
+    models = list(MODEL_MAP.keys())
     data = [{"id": m, "object": "model", "created": 1700000000, "owned_by": "onyx"} for m in models]
     return {"object": "list", "data": data}
 
@@ -1132,7 +1340,7 @@ async def save_config(payload: ConfigUpdate, request: Request) -> dict[str, Any]
     next_admin = payload.admin_password.strip() if payload.admin_password is not None else current.admin_password
     merged = AppConfig(
         onyx_base=payload.onyx_base,
-        onyx_keys=payload.onyx_keys,
+        onyx_cookies=payload.onyx_cookies,
         client_api_keys=payload.client_api_keys,
         default_persona=payload.default_persona,
         default_model=payload.default_model,
@@ -1150,21 +1358,183 @@ async def save_config(payload: ConfigUpdate, request: Request) -> dict[str, Any]
     return {"ok": True, "config": data}
 
 
+@app.post("/api/onyx-cookies/append")
 @app.post("/api/onyx-keys/append")
-async def append_onyx_key(payload: AppendOnyxKeyReq, request: Request) -> dict[str, Any]:
+async def append_onyx_cookie(payload: AppendOnyxCookieReq, request: Request) -> dict[str, Any]:
     cfg = await run_in_threadpool(store.get)
     if not check_admin_auth(cfg, request):
         raise HTTPException(status_code=401, detail="invalid admin password")
 
     try:
-        saved, inserted = await run_in_threadpool(store.append_onyx_key, payload.key)
+        saved, inserted = await run_in_threadpool(store.append_onyx_cookie, payload.cookie)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return {
         "ok": True,
         "inserted": inserted,
-        "total": len(saved.onyx_keys),
+        "total": len(saved.onyx_cookies),
+    }
+
+
+class VerifyCookieReq(BaseModel):
+    cookie: str = Field(default="", validation_alias=AliasChoices("cookie", "key"), serialization_alias="cookie")
+    model: str = ""
+
+
+class RemoveCookiesReq(BaseModel):
+    cookies: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("cookies", "keys"),
+        serialization_alias="cookies",
+    )
+
+
+@app.post("/api/onyx-cookies/verify")
+@app.post("/api/onyx-keys/verify")
+async def verify_onyx_cookie(payload: VerifyCookieReq, request: Request) -> dict[str, Any]:
+    """验证单个 Onyx Cookie 是否可用"""
+    cfg = await run_in_threadpool(store.get)
+    if not check_admin_auth(cfg, request):
+        raise HTTPException(status_code=401, detail="invalid admin password")
+
+    cookie = payload.cookie.strip()
+    if not cookie:
+        raise HTTPException(status_code=400, detail="cookie is required")
+
+    model = payload.model.strip() or cfg.default_model
+
+    if http is None:
+        raise HTTPException(status_code=500, detail="HTTP client not initialized")
+
+    try:
+        chat_session_id = await create_chat_session(cfg, cookie, cfg.default_persona)
+        body = {
+            "message": "Hi",
+            "chat_session_id": chat_session_id,
+            "parent_message_id": None,
+            "file_descriptors": [],
+            "internal_search_filters": {
+                "source_type": None,
+                "document_set": None,
+                "time_cutoff": None,
+                "tags": [],
+            },
+            "deep_research": False,
+            "forced_tool_id": None,
+            "llm_override": build_llm_override(model, 0.5),
+            "origin": ONYX_ORIGIN,
+        }
+
+        req = http.build_request(
+            "POST",
+            f"{cfg.onyx_base.rstrip('/')}/api/chat/send-chat-message",
+            json=body,
+            headers=build_onyx_headers(cfg, with_json=True),
+            cookies={"fastapiusersauth": _extract_auth_value(cookie)},
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        )
+        resp = await http.send(req, stream=True)
+
+        if resp.status_code != 200:
+            body_bytes = await resp.aread()
+            body_text = body_bytes.decode("utf-8", errors="ignore")[:512]
+            await resp.aclose()
+            return {
+                "cookie": cookie,
+                "alive": False,
+                "status": resp.status_code,
+                "error": body_text,
+            }
+
+        # 读取前几个事件，检查是否有错误
+        found_error = None
+        line_count = 0
+
+        async for line in resp.aiter_lines():
+            text = line.strip()
+            if not text:
+                continue
+            line_count += 1
+            try:
+                raw = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+
+            if raw.get("error") is not None and raw.get("obj") is None:
+                found_error = str(raw.get("error"))
+                break
+
+            obj = raw.get("obj")
+            if isinstance(obj, dict):
+                etype = str(obj.get("type", ""))
+                if etype == "error":
+                    found_error = str(obj.get("error", "Unknown error"))
+                    break
+                if etype == "stop":
+                    break
+
+            if line_count >= 20:
+                break
+
+        await resp.aclose()
+
+        if found_error:
+            return {
+                "cookie": cookie,
+                "alive": False,
+                "status": 200,
+                "error": found_error,
+            }
+
+        return {
+            "cookie": cookie,
+            "alive": True,
+            "status": 200,
+            "error": "",
+        }
+
+    except httpx.TimeoutException:
+        return {
+            "cookie": cookie,
+            "alive": False,
+            "status": 0,
+            "error": "Request timeout",
+        }
+    except Exception as exc:
+        return {
+            "cookie": cookie,
+            "alive": False,
+            "status": 0,
+            "error": str(exc),
+        }
+
+
+@app.post("/api/onyx-cookies/remove")
+@app.post("/api/onyx-keys/remove")
+async def remove_onyx_cookies(payload: RemoveCookiesReq, request: Request) -> dict[str, Any]:
+    """批量删除指定的 Onyx Cookies"""
+    cfg = await run_in_threadpool(store.get)
+    if not check_admin_auth(cfg, request):
+        raise HTTPException(status_code=401, detail="invalid admin password")
+
+    to_remove = set(k.strip() for k in payload.cookies if k.strip())
+    if not to_remove:
+        raise HTTPException(status_code=400, detail="cookies list is empty")
+
+    new_cookies = [k for k in cfg.onyx_cookies if k not in to_remove]
+    removed_count = len(cfg.onyx_cookies) - len(new_cookies)
+
+    cfg.onyx_cookies = new_cookies
+    try:
+        saved = await run_in_threadpool(store.set, cfg)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "ok": True,
+        "removed": removed_count,
+        "remaining": len(saved.onyx_cookies),
     }
 
 
@@ -1174,9 +1544,9 @@ async def handle_openai(req: OpenAIReq, request: Request) -> Any:
     if not check_client_auth(cfg, request):
         return JSONResponse(status_code=401, content={"error": "invalid api key"})
 
-    token = resolve_auth(cfg, request.headers.get("authorization"))
+    token = resolve_auth_cookie(cfg, request.headers.get("authorization"))
     if not token:
-        return JSONResponse(status_code=401, content={"error": "No auth. Configure onyx_keys in local config."})
+        return JSONResponse(status_code=401, content={"error": "No auth. Configure onyx_cookies in local config."})
 
     if not req.messages:
         return JSONResponse(status_code=400, content={"error": "messages is required"})
@@ -1248,13 +1618,13 @@ async def handle_anthropic(
             },
         )
 
-    token = resolve_auth(cfg, x_api_key, request.headers.get("authorization"))
+    token = resolve_auth_cookie(cfg, x_api_key, request.headers.get("authorization"))
     if not token:
         return JSONResponse(
             status_code=401,
             content={
                 "type": "error",
-                "error": {"type": "authentication_error", "message": "No auth. Configure onyx_keys in local config."},
+                "error": {"type": "authentication_error", "message": "No auth. Configure onyx_cookies in local config."},
             },
         )
 
@@ -1330,9 +1700,9 @@ if __name__ == "__main__":
 
     c = store.get()
     logger.info(
-        "onyx2api v%s | onyx_keys=%s | client_keys=%s | admin_password=%s",
+        "onyx2api v%s | onyx_cookies=%s | client_keys=%s | admin_password=%s",
         VERSION,
-        len(c.onyx_keys),
+        len(c.onyx_cookies),
         len(c.client_api_keys),
         c.admin_password,
     )

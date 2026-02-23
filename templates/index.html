@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>onyx2api 配置管理</title>
     <style>
       :root {
@@ -15,139 +15,306 @@
         --warn: #f59e0b;
         --danger: #ef4444;
         --line: #253051;
+        --radius: 12px;
       }
-      * { box-sizing: border-box; }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html { font-size: 16px; -webkit-tap-highlight-color: transparent; }
       body {
-        margin: 0;
         background: linear-gradient(180deg, #070b16 0%, #0b1020 100%);
         color: var(--text);
-        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        min-height: 100vh;
+        line-height: 1.5;
       }
-      .wrap { max-width: 1100px; margin: 32px auto; padding: 0 16px; }
+      .wrap { max-width: 800px; margin: 0 auto; padding: 16px; }
       .card {
         background: var(--panel);
         border: 1px solid var(--line);
-        border-radius: 14px;
-        padding: 18px;
-        box-shadow: 0 10px 25px rgba(0, 0, 0, .25);
+        border-radius: var(--radius);
+        padding: 16px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, .3);
       }
-      h1 { margin: 0 0 8px 0; font-size: 24px; }
-      .sub { color: var(--muted); margin-bottom: 18px; }
-      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+      h1 { font-size: 1.25rem; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+      .sub { color: var(--muted); font-size: 0.8rem; margin-bottom: 16px; word-break: break-all; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
       .full { grid-column: 1 / -1; }
-      label {
-        display: block;
-        font-size: 13px;
-        color: var(--muted);
-        margin-bottom: 6px;
-      }
+      label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 4px; font-weight: 500; }
       input, textarea {
-        width: 100%;
-        background: #0b1327;
-        color: var(--text);
-        border: 1px solid var(--line);
-        border-radius: 10px;
-        padding: 10px 12px;
-        outline: none;
+        width: 100%; background: #0b1327; color: var(--text);
+        border: 1px solid var(--line); border-radius: 10px;
+        padding: 12px; outline: none; font-size: 1rem;
+        transition: border-color 0.2s; -webkit-appearance: none;
       }
-      textarea { min-height: 84px; resize: vertical; }
-      .row { display: flex; gap: 8px; align-items: center; }
+      input:focus, textarea:focus { border-color: #2563eb; }
+      textarea {
+        min-height: 90px; resize: vertical;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.875rem; line-height: 1.6;
+      }
+      .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
       .btn {
-        border: none;
-        border-radius: 10px;
-        padding: 10px 14px;
-        color: white;
-        cursor: pointer;
+        border: none; border-radius: 10px; padding: 12px 8px;
+        color: white; cursor: pointer; font-size: 0.9rem; font-weight: 600;
+        text-align: center; transition: opacity 0.2s, transform 0.1s;
+        -webkit-appearance: none; touch-action: manipulation;
       }
+      .btn:active { opacity: 0.8; transform: scale(0.97); }
+      .btn:disabled { opacity: 0.5; cursor: not-allowed; }
       .btn-primary { background: #2563eb; }
       .btn-secondary { background: #334155; }
       .btn-danger { background: #b91c1c; }
-      .status {
-        min-height: 24px;
-        margin: 14px 0;
-        font-size: 14px;
-      }
+      .btn-purple { background: #7c3aed; }
+      .btn-sm { padding: 6px 10px; font-size: 0.75rem; border-radius: 8px; }
+      .status { min-height: 20px; margin: 12px 0; font-size: 0.85rem; font-weight: 500; word-break: break-word; }
       .ok { color: var(--ok); }
       .warn { color: var(--warn); }
       .danger { color: var(--danger); }
+      .health-card {
+        margin-top: 14px; background: #0d152b;
+        border: 1px solid var(--line); border-radius: var(--radius); padding: 14px;
+      }
+      .health-title { font-weight: 600; margin-bottom: 10px; font-size: 0.9rem; }
       .kv {
-        display: grid;
-        grid-template-columns: 150px 1fr;
-        gap: 6px 10px;
-        margin-top: 8px;
+        display: grid; grid-template-columns: auto 1fr; gap: 4px 12px;
+        font-size: 0.8rem; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        word-break: break-all;
       }
-      .mono {
+      .kv div:nth-child(odd) { color: var(--muted); white-space: nowrap; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+      .login-overlay {
+        position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(7,11,22,0.95);
+        display: flex; align-items: center; justify-content: center;
+        z-index: 999; padding: 16px;
+      }
+      .login-box {
+        background: var(--panel); border: 1px solid var(--line);
+        border-radius: var(--radius); padding: 24px 20px;
+        width: 100%; max-width: 380px; box-shadow: 0 20px 50px rgba(0,0,0,.5);
+      }
+      .login-box h2 { font-size: 1.2rem; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+      .remember-row {
+        display: flex; align-items: center; gap: 8px;
+        margin-top: 12px; font-size: 0.85rem; color: var(--muted);
+      }
+      .remember-row input[type=checkbox] { width: 18px; height: 18px; accent-color: #2563eb; }
+      .remember-row label { margin: 0; cursor: pointer; }
+      .login-btn { width: 100%; margin-top: 16px; padding: 14px; font-size: 1rem; }
+      .divider { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
+      .section-title {
+        font-size: 0.85rem; font-weight: 600; color: var(--muted);
+        margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+      }
+      /* 验活相关样式 */
+      .verify-card {
+        margin-top: 14px; background: #0d152b;
+        border: 1px solid var(--line); border-radius: var(--radius); padding: 14px;
+      }
+      .verify-header {
+        display: flex; justify-content: space-between; align-items: center;
+        flex-wrap: wrap; gap: 8px; margin-bottom: 12px;
+      }
+      .verify-header .section-title { margin-bottom: 0; }
+      .verify-progress {
+        font-size: 0.8rem; color: var(--muted); margin-bottom: 10px;
+      }
+      .verify-progress .bar {
+        height: 6px; background: #1e293b; border-radius: 3px;
+        margin-top: 4px; overflow: hidden;
+      }
+      .verify-progress .bar-fill {
+        height: 100%; background: #2563eb; border-radius: 3px;
+        transition: width 0.3s ease;
+      }
+      .key-list { display: flex; flex-direction: column; gap: 8px; }
+      .key-item {
+        background: #0b1327; border: 1px solid var(--line);
+        border-radius: 10px; padding: 10px 12px;
+        display: flex; flex-direction: column; gap: 6px;
+      }
+      .key-item.alive { border-left: 3px solid var(--ok); }
+      .key-item.dead { border-left: 3px solid var(--danger); }
+      .key-item.pending { border-left: 3px solid var(--muted); }
+      .key-item.checking { border-left: 3px solid var(--warn); }
+      .key-top {
+        display: flex; justify-content: space-between;
+        align-items: center; gap: 8px;
+      }
+      .key-text {
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.8rem; word-break: break-all; flex: 1;
       }
-      @media (max-width: 880px) {
-        .grid { grid-template-columns: 1fr; }
+      .key-status { font-size: 0.75rem; white-space: nowrap; font-weight: 600; }
+      .key-error {
+        font-size: 0.75rem; color: var(--danger);
+        word-break: break-word; line-height: 1.4;
+      }
+      .key-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+      .badge {
+        display: inline-block; padding: 2px 8px; border-radius: 6px;
+        font-size: 0.7rem; font-weight: 600;
+      }
+      .badge-ok { background: rgba(34,197,94,0.15); color: var(--ok); }
+      .badge-fail { background: rgba(239,68,68,0.15); color: var(--danger); }
+      .badge-wait { background: rgba(152,162,179,0.15); color: var(--muted); }
+      .badge-check { background: rgba(245,158,11,0.15); color: var(--warn); }
+      .summary-row {
+        display: flex; gap: 16px; flex-wrap: wrap;
+        font-size: 0.85rem; margin: 10px 0;
+      }
+      @media (max-width: 600px) {
+        .wrap { padding: 10px; }
+        .card { padding: 14px; }
+        .grid { grid-template-columns: 1fr; gap: 10px; }
+        .btn-row { grid-template-columns: 1fr 1fr; gap: 8px; }
+        h1 { font-size: 1.1rem; }
+        input, textarea { padding: 11px; }
+        .verify-header { flex-direction: column; align-items: flex-start; }
+      }
+      @media (max-width: 360px) {
+        .btn-row { grid-template-columns: 1fr; }
       }
     </style>
   </head>
   <body>
-    <div class="wrap">
-      <div class="card">
-        <h1>onyx2api 配置管理</h1>
-        <div class="sub">版本：{{ version }} ｜ 配置保存在本地 <span class="mono">config.json</span></div>
 
-        <div class="grid" style="margin-bottom: 12px;">
+    <!-- 登录遮罩层 -->
+    <div class="login-overlay" id="loginOverlay">
+      <div class="login-box">
+        <h2>🔐 管理登录</h2>
+        <div>
+          <label for="login_password">管理密码</label>
+          <input id="login_password" type="password" placeholder="请输入管理密码" autocomplete="current-password" />
+        </div>
+        <div class="remember-row">
+          <input type="checkbox" id="remember_pwd" checked />
+          <label for="remember_pwd">记住密码</label>
+        </div>
+        <div class="status" id="login_status"></div>
+        <button class="btn btn-primary login-btn" id="loginBtn">登录</button>
+      </div>
+    </div>
+
+    <!-- 主界面 -->
+    <div class="wrap" id="mainWrap" style="display:none;">
+      <div class="card">
+        <h1>⚙️ onyx2api</h1>
+        <div class="sub">v{{ version }} ｜ 配置保存于 <span class="mono">config.json</span></div>
+
+        <div class="section-title">🔑 密码管理</div>
+        <div class="grid">
           <div>
-            <label for="admin_password">管理密码（必填）</label>
-            <input id="admin_password" type="password" placeholder="输入当前管理密码" />
+            <label>当前密码</label>
+            <input id="admin_password" type="password" disabled style="opacity:0.5;" />
           </div>
           <div>
-            <label for="new_admin_password">新管理密码（可选）</label>
-            <input id="new_admin_password" type="password" placeholder="留空则不修改" />
+            <label for="new_admin_password">新密码（可选）</label>
+            <input id="new_admin_password" type="password" placeholder="留空不修改" autocomplete="new-password" />
           </div>
         </div>
 
+        <hr class="divider" />
+
+        <div class="section-title">🌐 服务配置</div>
         <div class="status" id="status"></div>
 
         <div class="grid">
           <div>
             <label for="onyx_base">Onyx Base URL</label>
-            <input id="onyx_base" type="text" placeholder="https://cloud.onyx.app" />
+            <input id="onyx_base" type="url" placeholder="https://cloud.onyx.app" />
           </div>
           <div>
             <label for="default_model">默认模型</label>
-            <input id="default_model" type="text" placeholder="claude-opus-4-6" />
+            <input id="default_model" type="text" placeholder="claude-opus-4.6" />
           </div>
           <div>
-            <label for="default_persona">默认 Persona ID</label>
-            <input id="default_persona" type="number" min="1" />
+            <label for="default_persona">Persona ID</label>
+            <input id="default_persona" type="number" min="1" inputmode="numeric" />
           </div>
           <div>
-            <label for="request_timeout_seconds">请求超时（秒）</label>
-            <input id="request_timeout_seconds" type="number" min="30" />
+            <label for="request_timeout_seconds">超时（秒）</label>
+            <input id="request_timeout_seconds" type="number" min="30" inputmode="numeric" />
           </div>
-
           <div class="full">
             <label for="onyx_keys">ONYX Keys（每行一个）</label>
-            <textarea id="onyx_keys" placeholder="key_1\nkey_2"></textarea>
+            <textarea id="onyx_keys" placeholder="key_1&#10;key_2" spellcheck="false"></textarea>
           </div>
-
           <div class="full">
             <label for="client_api_keys">访问令牌（每行一个，可选）</label>
-            <textarea id="client_api_keys" placeholder="client_key_1\nclient_key_2"></textarea>
+            <textarea id="client_api_keys" placeholder="client_key_1&#10;client_key_2" spellcheck="false"></textarea>
           </div>
         </div>
 
-        <div class="row" style="margin-top: 14px;">
-          <button class="btn btn-primary" id="saveBtn">保存配置</button>
-          <button class="btn btn-secondary" id="reloadBtn">重新加载</button>
-          <button class="btn btn-danger" id="healthBtn">检查健康状态</button>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="saveBtn">💾 保存</button>
+          <button class="btn btn-secondary" id="reloadBtn">🔄 刷新</button>
+          <button class="btn btn-danger" id="healthBtn">❤️ 健康检查</button>
+          <button class="btn btn-secondary" id="logoutBtn">🚪 退出</button>
         </div>
 
-        <div class="card" style="margin-top: 16px; background:#0d152b;">
-          <div style="font-weight: 600; margin-bottom: 8px;">运行状态</div>
-          <div class="kv mono" id="healthKV"></div>
+        <!-- 添加 Key 区域 -->
+        <div class="verify-card" style="margin-top:14px;">
+          <div class="verify-header">
+            <div class="section-title" style="margin:0;">➕ 添加 ONYX Key</div>
+          </div>
+          <div style="margin-bottom:10px;">
+            <textarea id="addKeysInput" placeholder="粘贴 Key，支持逗号、空格、换行分隔&#10;例如: key1, key2&#10;key3" spellcheck="false" style="min-height:70px;"></textarea>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <button class="btn btn-primary btn-sm" id="addKeysBtn">➕ 添加</button>
+            <span class="mono" style="font-size:0.75rem;color:var(--muted);" id="addKeysStatus"></span>
+          </div>
+        </div>
+
+        <!-- 验活功能区 -->
+        <div class="verify-card">
+          <div class="verify-header">
+            <div class="section-title" style="margin:0;">🔍 Key 批量验活</div>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              <button class="btn btn-purple btn-sm" id="verifyAllBtn">▶ 全部验活</button>
+              <button class="btn btn-danger btn-sm" id="removeDeadBtn" style="display:none;">🗑 删除失效</button>
+              <button class="btn btn-secondary btn-sm" id="clearVerifyBtn" style="display:none;">✕ 清除结果</button>
+            </div>
+          </div>
+
+          <div class="verify-progress" id="verifyProgress" style="display:none;">
+            <span id="verifyProgressText">验证中...</span>
+            <div class="bar"><div class="bar-fill" id="verifyBar" style="width:0%"></div></div>
+          </div>
+
+          <div class="summary-row" id="verifySummary" style="display:none;">
+            <span>总计: <strong id="sumTotal">0</strong></span>
+            <span class="ok">✅ 存活: <strong id="sumAlive">0</strong></span>
+            <span class="danger">❌ 失效: <strong id="sumDead">0</strong></span>
+            <span class="warn">⏳ 待验: <strong id="sumPending">0</strong></span>
+          </div>
+
+          <div class="key-list" id="keyList"></div>
+        </div>
+
+        <div class="health-card">
+          <div class="health-title">📊 运行状态</div>
+          <div class="kv" id="healthKV">
+            <div>status</div><div style="color:var(--muted)">点击「健康检查」查看</div>
+          </div>
         </div>
       </div>
+      <div style="height: 80px;"></div>
     </div>
 
     <script>
+      const STORAGE_KEY = 'onyx2api_admin_pwd';
+      const loginOverlay = document.getElementById('loginOverlay');
+      const mainWrap = document.getElementById('mainWrap');
+      const loginPassword = document.getElementById('login_password');
+      const loginStatus = document.getElementById('login_status');
+      const rememberPwd = document.getElementById('remember_pwd');
       const statusEl = document.getElementById('status');
       const healthKV = document.getElementById('healthKV');
+
+      let currentPassword = '';
+      let verifyRunning = false;
+      let verifyResults = []; // {key, status: 'pending'|'checking'|'alive'|'dead', error:''}
 
       const fields = {
         admin_password: document.getElementById('admin_password'),
@@ -160,17 +327,9 @@
         client_api_keys: document.getElementById('client_api_keys'),
       };
 
-      function setStatus(type, msg) {
-        statusEl.className = 'status ' + type;
-        statusEl.textContent = msg;
-      }
-
-      function splitLines(text) {
-        return text
-          .split(/\r?\n/g)
-          .map(v => v.trim())
-          .filter(Boolean);
-      }
+      function setStatus(type, msg) { statusEl.className = 'status ' + type; statusEl.textContent = msg; }
+      function setLoginStatus(type, msg) { loginStatus.className = 'status ' + type; loginStatus.textContent = msg; }
+      function splitLines(text) { return text.split(/\r?\n/g).map(v => v.trim()).filter(Boolean); }
 
       function fillForm(cfg) {
         fields.onyx_base.value = cfg.onyx_base ?? '';
@@ -193,67 +352,406 @@
         };
       }
 
-      function adminHeaders() {
-        return {
-          'X-Admin-Password': fields.admin_password.value.trim(),
-        };
+      function adminHeaders() { return { 'X-Admin-Password': currentPassword }; }
+
+      function maskKey(key) {
+        if (key.length <= 12) return key;
+        return key.slice(0, 8) + '...' + key.slice(-4);
+      }
+
+      // ========== 验活 UI ==========
+      function renderKeyList() {
+        const list = document.getElementById('keyList');
+        const summary = document.getElementById('verifySummary');
+        const removeBtn = document.getElementById('removeDeadBtn');
+        const clearBtn = document.getElementById('clearVerifyBtn');
+
+        if (verifyResults.length === 0) {
+          list.innerHTML = '<div style="color:var(--muted);font-size:0.85rem;text-align:center;padding:20px;">点击「全部验活」开始检测所有 Key</div>';
+          summary.style.display = 'none';
+          removeBtn.style.display = 'none';
+          clearBtn.style.display = 'none';
+          return;
+        }
+
+        clearBtn.style.display = '';
+
+        const counts = { total: verifyResults.length, alive: 0, dead: 0, pending: 0 };
+        verifyResults.forEach(r => {
+          if (r.status === 'alive') counts.alive++;
+          else if (r.status === 'dead') counts.dead++;
+          else counts.pending++;
+        });
+
+        document.getElementById('sumTotal').textContent = counts.total;
+        document.getElementById('sumAlive').textContent = counts.alive;
+        document.getElementById('sumDead').textContent = counts.dead;
+        document.getElementById('sumPending').textContent = counts.pending;
+        summary.style.display = 'flex';
+
+        removeBtn.style.display = counts.dead > 0 ? '' : 'none';
+
+        list.innerHTML = verifyResults.map((r, i) => {
+          const cls = r.status;
+          const badgeCls = { alive: 'badge-ok', dead: 'badge-fail', pending: 'badge-wait', checking: 'badge-check' }[r.status] || 'badge-wait';
+          const badgeText = { alive: '✅ 正常', dead: '❌ 失效', pending: '⏳ 待验', checking: '🔄 验证中...' }[r.status] || '⏳';
+
+          let html = `<div class="key-item ${cls}" id="key-item-${i}">`;
+          html += `<div class="key-top">`;
+          html += `<span class="key-text">${maskKey(r.key)}</span>`;
+          html += `<span class="badge ${badgeCls}">${badgeText}</span>`;
+          html += `</div>`;
+
+          if (r.error) {
+            html += `<div class="key-error">💬 ${r.error}</div>`;
+          }
+
+          if (r.status === 'alive' || r.status === 'dead') {
+            html += `<div class="key-actions">`;
+            html += `<button class="btn btn-secondary btn-sm" onclick="verifySingle(${i})">🔄 重新验证</button>`;
+            html += `<button class="btn btn-danger btn-sm" onclick="removeSingle(${i})">🗑 删除</button>`;
+            html += `</div>`;
+          }
+
+          html += `</div>`;
+          return html;
+        }).join('');
+      }
+
+      function updateProgress(current, total) {
+        const prog = document.getElementById('verifyProgress');
+        const text = document.getElementById('verifyProgressText');
+        const bar = document.getElementById('verifyBar');
+        if (total <= 0) {
+          prog.style.display = 'none';
+          return;
+        }
+        prog.style.display = 'block';
+        const pct = Math.round((current / total) * 100);
+        text.textContent = `验证中... ${current}/${total} (${pct}%)`;
+        bar.style.width = pct + '%';
+      }
+
+      async function verifyOneKey(index) {
+        const r = verifyResults[index];
+        r.status = 'checking';
+        r.error = '';
+        renderKeyList();
+
+        try {
+          const resp = await fetch('/api/onyx-keys/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...adminHeaders() },
+            body: JSON.stringify({ key: r.key }),
+          });
+          const data = await resp.json();
+
+          if (!resp.ok) {
+            r.status = 'dead';
+            r.error = data?.detail || `HTTP ${resp.status}`;
+          } else if (data.alive) {
+            r.status = 'alive';
+            r.error = '';
+          } else {
+            r.status = 'dead';
+            r.error = data.error || `HTTP ${data.status}`;
+          }
+        } catch (err) {
+          r.status = 'dead';
+          r.error = err.message;
+        }
+
+        renderKeyList();
+      }
+
+      window.verifySingle = async function(index) {
+        if (verifyRunning) return;
+        await verifyOneKey(index);
+      };
+
+      window.removeSingle = async function(index) {
+        if (verifyRunning) return;
+        const r = verifyResults[index];
+        if (!confirm(`确定要删除这个 Key 吗？\n${maskKey(r.key)}`)) return;
+
+        try {
+          const resp = await fetch('/api/onyx-keys/remove', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...adminHeaders() },
+            body: JSON.stringify({ keys: [r.key] }),
+          });
+          const data = await resp.json();
+          if (resp.ok && data.ok) {
+            verifyResults.splice(index, 1);
+            renderKeyList();
+            await loadConfig();
+            setStatus('ok', '✅ 已删除 1 个 Key');
+          } else {
+            setStatus('danger', '删除失败: ' + (data?.detail || ''));
+          }
+        } catch (err) {
+          setStatus('danger', '删除失败: ' + err.message);
+        }
+      };
+
+      async function addKeys() {
+        const raw = document.getElementById('addKeysInput').value;
+        const statusEl = document.getElementById('addKeysStatus');
+        // 支持逗号、分号、空格、换行分隔
+        const keys = raw.split(/[,;\s\n\r]+/).map(k => k.trim()).filter(Boolean);
+
+        if (keys.length === 0) {
+          statusEl.style.color = 'var(--danger)';
+          statusEl.textContent = '请输入至少一个 Key';
+          return;
+        }
+
+        // 去重
+        const unique = [...new Set(keys)];
+        statusEl.style.color = 'var(--warn)';
+        statusEl.textContent = `正在添加 ${unique.length} 个 Key...`;
+
+        document.getElementById('addKeysBtn').disabled = true;
+        let added = 0, skipped = 0, failed = 0;
+
+        for (const key of unique) {
+          try {
+            const resp = await fetch('/api/onyx-keys/append', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', ...adminHeaders() },
+              body: JSON.stringify({ key }),
+            });
+            const data = await resp.json();
+            if (resp.ok && data.ok) {
+              if (data.inserted) added++;
+              else skipped++;
+            } else {
+              failed++;
+            }
+          } catch (err) {
+            failed++;
+          }
+        }
+
+        const parts = [];
+        if (added > 0) parts.push(`✅ 新增 ${added}`);
+        if (skipped > 0) parts.push(`⏭ 重复 ${skipped}`);
+        if (failed > 0) parts.push(`❌ 失败 ${failed}`);
+
+        statusEl.style.color = failed > 0 ? 'var(--warn)' : 'var(--ok)';
+        statusEl.textContent = parts.join('，');
+
+        document.getElementById('addKeysBtn').disabled = false;
+
+        if (added > 0) {
+          document.getElementById('addKeysInput').value = '';
+          await loadConfig();
+        }
+      }
+
+      async function verifyAll() {
+        if (verifyRunning) return;
+        const keys = splitLines(fields.onyx_keys.value);
+        if (keys.length === 0) {
+          setStatus('danger', '没有可验证的 Key');
+          return;
+        }
+
+        verifyRunning = true;
+        document.getElementById('verifyAllBtn').disabled = true;
+        document.getElementById('verifyAllBtn').textContent = '⏳ 验证中...';
+
+        verifyResults = keys.map(k => ({ key: k, status: 'pending', error: '' }));
+        renderKeyList();
+
+        const total = verifyResults.length;
+        const concurrency = Math.max(1, Math.ceil(total / 4));
+        let completed = 0;
+
+        async function worker(indices) {
+          for (const i of indices) {
+            await verifyOneKey(i);
+            completed++;
+            updateProgress(completed, total);
+          }
+        }
+
+        // 将索引分成 concurrency 组并发执行
+        const chunks = [];
+        for (let i = 0; i < total; i++) {
+          const chunkIdx = i % concurrency;
+          if (!chunks[chunkIdx]) chunks[chunkIdx] = [];
+          chunks[chunkIdx].push(i);
+        }
+
+        await Promise.all(chunks.map(indices => worker(indices)));
+
+        document.getElementById('verifyProgress').style.display = 'none';
+
+        const alive = verifyResults.filter(r => r.status === 'alive').length;
+        const dead = verifyResults.filter(r => r.status === 'dead').length;
+        setStatus('ok', `✅ 验活完成：${alive} 个正常，${dead} 个失效（并发 ${concurrency} 路）`);
+
+        verifyRunning = false;
+        document.getElementById('verifyAllBtn').disabled = false;
+        document.getElementById('verifyAllBtn').textContent = '▶ 全部验活';
+      }
+
+      async function removeAllDead() {
+        if (verifyRunning) return;
+        const deadKeys = verifyResults.filter(r => r.status === 'dead').map(r => r.key);
+        if (deadKeys.length === 0) {
+          setStatus('warn', '没有失效的 Key');
+          return;
+        }
+
+        if (!confirm(`确定要删除 ${deadKeys.length} 个失效 Key 吗？`)) return;
+
+        try {
+          const resp = await fetch('/api/onyx-keys/remove', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...adminHeaders() },
+            body: JSON.stringify({ keys: deadKeys }),
+          });
+          const data = await resp.json();
+          if (resp.ok && data.ok) {
+            verifyResults = verifyResults.filter(r => r.status !== 'dead');
+            renderKeyList();
+            await loadConfig();
+            setStatus('ok', `✅ 已删除 ${data.removed} 个失效 Key，剩余 ${data.remaining} 个`);
+          } else {
+            setStatus('danger', '删除失败: ' + (data?.detail || ''));
+          }
+        } catch (err) {
+          setStatus('danger', '删除失败: ' + err.message);
+        }
+      }
+
+      function clearVerify() {
+        verifyResults = [];
+        renderKeyList();
+        document.getElementById('verifyProgress').style.display = 'none';
+      }
+
+      // ========== 原有功能 ==========
+      async function tryLogin(pwd) {
+        const resp = await fetch('/api/config', { headers: { 'X-Admin-Password': pwd } });
+        const data = await resp.json();
+        if (!resp.ok) return { ok: false, msg: data?.detail || '密码错误' };
+        return { ok: true, config: data.config };
+      }
+
+      async function doLogin() {
+        const pwd = loginPassword.value.trim();
+        if (!pwd) { setLoginStatus('danger', '请输入管理密码'); return; }
+        setLoginStatus('warn', '正在验证...');
+        try {
+          const result = await tryLogin(pwd);
+          if (!result.ok) { setLoginStatus('danger', result.msg); return; }
+          currentPassword = pwd;
+          fields.admin_password.value = '••••••••';
+          if (rememberPwd.checked) localStorage.setItem(STORAGE_KEY, pwd);
+          else localStorage.removeItem(STORAGE_KEY);
+          loginOverlay.style.display = 'none';
+          mainWrap.style.display = 'block';
+          fillForm(result.config || {});
+          setStatus('ok', '✅ 配置已加载');
+          healthCheck();
+        } catch (err) { setLoginStatus('danger', '连接失败：' + err.message); }
       }
 
       async function loadConfig() {
         setStatus('warn', '正在加载配置...');
-        const resp = await fetch('/api/config', {
-          headers: adminHeaders(),
-        });
-        const data = await resp.json();
-        if (!resp.ok) {
-          const msg = data?.detail || data?.error || JSON.stringify(data);
-          setStatus('danger', '加载失败：' + msg);
-          return;
-        }
-        fillForm(data.config || {});
-        setStatus('ok', '配置已加载');
+        try {
+          const resp = await fetch('/api/config', { headers: adminHeaders() });
+          const data = await resp.json();
+          if (!resp.ok) { setStatus('danger', '加载失败：' + (data?.detail || '')); return; }
+          fillForm(data.config || {});
+          setStatus('ok', '✅ 配置已加载');
+        } catch (err) { setStatus('danger', '加载失败：' + err.message); }
       }
 
       async function saveConfig() {
         const payload = readForm();
-        setStatus('warn', '正在保存配置...');
-        const resp = await fetch('/api/config', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...adminHeaders(),
-          },
-          body: JSON.stringify(payload),
-        });
-        const data = await resp.json();
-        if (!resp.ok) {
-          const msg = data?.detail || data?.error || JSON.stringify(data);
-          setStatus('danger', '保存失败：' + msg);
-          return;
-        }
-        fillForm(data.config || payload);
-        fields.new_admin_password.value = '';
-        setStatus('ok', '配置保存成功');
+        setStatus('warn', '正在保存...');
+        try {
+          const resp = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...adminHeaders() },
+            body: JSON.stringify(payload),
+          });
+          const data = await resp.json();
+          if (!resp.ok) { setStatus('danger', '保存失败：' + (data?.detail || '')); return; }
+          fillForm(data.config || payload);
+          if (fields.new_admin_password.value.trim()) {
+            currentPassword = fields.new_admin_password.value.trim();
+            if (localStorage.getItem(STORAGE_KEY) !== null) localStorage.setItem(STORAGE_KEY, currentPassword);
+          }
+          fields.new_admin_password.value = '';
+          setStatus('ok', '✅ 配置保存成功');
+        } catch (err) { setStatus('danger', '保存失败：' + err.message); }
       }
 
       async function healthCheck() {
-        setStatus('warn', '正在检查健康状态...');
-        const resp = await fetch('/health');
-        const data = await resp.json();
-        if (!resp.ok) {
-          setStatus('danger', '健康检查失败');
-          return;
-        }
-        const rows = Object.entries(data).map(([k, v]) => `<div>${k}</div><div>${String(v)}</div>`);
-        healthKV.innerHTML = rows.join('');
-        setStatus('ok', '健康检查通过');
+        try {
+          const resp = await fetch('/health');
+          const data = await resp.json();
+          if (!resp.ok) { healthKV.innerHTML = '<div>error</div><div style="color:var(--danger)">检查失败</div>'; return; }
+          const rows = Object.entries(data).map(([k, v]) => {
+            let color = 'var(--text)';
+            if (k === 'status' && v === 'ok') color = 'var(--ok)';
+            return `<div>${k}</div><div style="color:${color}">${String(v)}</div>`;
+          });
+          healthKV.innerHTML = rows.join('');
+        } catch (err) { healthKV.innerHTML = `<div>error</div><div style="color:var(--danger)">${err.message}</div>`; }
       }
 
+      function logout() {
+        currentPassword = '';
+        localStorage.removeItem(STORAGE_KEY);
+        fields.admin_password.value = '';
+        loginPassword.value = '';
+        setLoginStatus('', '');
+        loginOverlay.style.display = 'flex';
+        mainWrap.style.display = 'none';
+      }
+
+      // 事件绑定
       document.getElementById('saveBtn').addEventListener('click', saveConfig);
       document.getElementById('reloadBtn').addEventListener('click', loadConfig);
       document.getElementById('healthBtn').addEventListener('click', healthCheck);
+      document.getElementById('logoutBtn').addEventListener('click', logout);
+      document.getElementById('loginBtn').addEventListener('click', doLogin);
+      document.getElementById('addKeysBtn').addEventListener('click', addKeys);
+      document.getElementById('verifyAllBtn').addEventListener('click', verifyAll);
+      document.getElementById('removeDeadBtn').addEventListener('click', removeAllDead);
+      document.getElementById('clearVerifyBtn').addEventListener('click', clearVerify);
+      loginPassword.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 
-      loadConfig().then(healthCheck).catch(err => setStatus('danger', '初始化失败：' + err.message));
+      // 自动登录
+      (async function init() {
+        renderKeyList();
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          loginPassword.value = saved;
+          setLoginStatus('warn', '正在自动登录...');
+          try {
+            const result = await tryLogin(saved);
+            if (result.ok) {
+              currentPassword = saved;
+              fields.admin_password.value = '••••••••';
+              loginOverlay.style.display = 'none';
+              mainWrap.style.display = 'block';
+              fillForm(result.config || {});
+              setStatus('ok', '✅ 配置已自动加载');
+              healthCheck();
+              return;
+            }
+          } catch (e) {}
+          localStorage.removeItem(STORAGE_KEY);
+          setLoginStatus('danger', '密码已失效，请重新输入');
+        }
+      })();
     </script>
   </body>
 </html>
