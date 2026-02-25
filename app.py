@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import AliasChoices, BaseModel, Field
@@ -196,7 +196,7 @@ app = FastAPI(title="onyx2api-py", version=VERSION)
 @app.middleware("http")
 async def add_cors_headers(request: Request, call_next):
     if request.method == "OPTIONS":
-        response = JSONResponse(status_code=204, content={})
+        response = Response(status_code=204)
     else:
         response = await call_next(request)
     response.headers["Access-Control-Allow-Origin"] = "*"
