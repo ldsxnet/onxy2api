@@ -336,7 +336,11 @@
         fields.default_model.value = cfg.default_model ?? '';
         fields.default_persona.value = cfg.default_persona ?? 1;
         fields.request_timeout_seconds.value = cfg.request_timeout_seconds ?? 300;
-        fields.onyx_keys.value = (cfg.onyx_keys || []).join('\n');
+        // 后端当前序列化字段为 onyx_cookies，兼容旧字段 onyx_keys
+        const onyxValues = Array.isArray(cfg.onyx_cookies)
+          ? cfg.onyx_cookies
+          : (Array.isArray(cfg.onyx_keys) ? cfg.onyx_keys : []);
+        fields.onyx_keys.value = onyxValues.join('\n');
         fields.client_api_keys.value = (cfg.client_api_keys || []).join('\n');
       }
 
