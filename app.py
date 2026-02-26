@@ -535,6 +535,32 @@ def clear_cookie_error_count(cookie_str: str) -> None:
         _cookie_error_counts.pop(cookie_id, None)
 
 
+def get_failed_cookie_items(cfg: AppConfig) -> list[dict[str, Any]]:
+    cookie_by_id: dict[str, str] = {}
+    for item in cfg.onyx_cookies:
+        cookie_id = _cookie_error_identifier(item)
+        if cookie_id:
+            cookie_by_id[cookie_id] = item
+
+    with _cookie_error_lock:
+        snapshot = dict(_cookie_error_counts)
+        stale_ids = [cookie_id for cookie_id in snapshot if cookie_id not in cookie_by_id]
+        for cookie_id in stale_ids:
+            _cookie_error_counts.pop(cookie_id, None)
+
+    items: list[dict[str, Any]] = []
+    for cookie_id, fail_count in snapshot.items():
+        if fail_count <= 0:
+            continue
+        cookie = cookie_by_id.get(cookie_id, "")
+        if not cookie:
+            continue
+        items.append({"cookie": cookie, "fail_count": fail_count})
+
+    items.sort(key=lambda x: int(x.get("fail_count", 0)), reverse=True)
+    return items
+
+
 async def mark_cookie_error(cfg: AppConfig, cookie_str: str, reason: str) -> None:
     cookie_id = _cookie_error_identifier(cookie_str)
     if not cookie_id:
@@ -1767,6 +1793,85 @@ async def remove_onyx_cookies(payload: RemoveCookiesReq, request: Request) -> di
         saved = await run_in_threadpool(store.set, cfg)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "ok": True,
+        "removed": removed_count,
+        "remaining": len(saved.onyx_cookies),
+    }
+
+
+@app.get("/api/onyx-cookies/failed")
+@app.get("/api/onyx-keys/failed")
+async def list_failed_onyx_cookies(request: Request) -> dict[str, Any]:
+    """返回出现过失败记录的 Onyx Cookies"""
+    cfg = await run_in_threadpool(store.get)
+    if not check_admin_auth(cfg, request):
+        raise HTTPException(status_code=401, detail="invalid admin password")
+
+    items = get_failed_cookie_items(cfg)
+    return {
+        "ok": True,
+        "items": items,
+        "total": len(items),
+    }
+
+
+@app.post("/api/onyx-cookies/remove-failed")
+@app.post("/api/onyx-keys/remove-failed")
+async def remove_failed_onyx_cookies(request: Request) -> dict[str, Any]:
+    """一键删除失败过的 Onyx Cookies"""
+    global _cookie_index
+
+    cfg = await run_in_threadpool(store.get)
+    if not check_admin_auth(cfg, request):
+        raise HTTPException(status_code=401, detail="invalid admin password")
+
+    failed_items = get_failed_cookie_items(cfg)
+    failed_ids = {_cookie_error_identifier(item.get("cookie", "")) for item in failed_items}
+    failed_ids = {item for item in failed_ids if item}
+
+    if not failed_ids:
+        return {
+            "ok": True,
+            "removed": 0,
+            "remaining": len(cfg.onyx_cookies),
+        }
+
+    kept_cookies: list[str] = []
+    removed_count = 0
+    removed_ids: set[str] = set()
+
+    for cookie in cfg.onyx_cookies:
+        cookie_id = _cookie_error_identifier(cookie)
+        if cookie_id and cookie_id in failed_ids:
+            removed_count += 1
+            removed_ids.add(cookie_id)
+            continue
+        kept_cookies.append(cookie)
+
+    if removed_count <= 0:
+        return {
+            "ok": True,
+            "removed": 0,
+            "remaining": len(cfg.onyx_cookies),
+        }
+
+    cfg.onyx_cookies = kept_cookies
+    try:
+        saved = await run_in_threadpool(store.set, cfg)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    with _cookie_lock:
+        if saved.onyx_cookies:
+            _cookie_index %= len(saved.onyx_cookies)
+        else:
+            _cookie_index = 0
+
+    with _cookie_error_lock:
+        for cookie_id in removed_ids:
+            _cookie_error_counts.pop(cookie_id, None)
 
     return {
         "ok": True,

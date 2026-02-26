@@ -292,6 +292,24 @@
           <div class="key-list" id="keyList"></div>
         </div>
 
+        <!-- 失败 Cookie 列表 -->
+        <div class="verify-card">
+          <div class="verify-header">
+            <div class="section-title" style="margin:0;">⚠️ 失败 Cookie 列表</div>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              <button class="btn btn-secondary btn-sm" id="refreshFailedCookiesBtn">🔄 刷新</button>
+              <button class="btn btn-danger btn-sm" id="removeFailedCookiesBtn" style="display:none;">🗑 一键删除全部</button>
+            </div>
+          </div>
+
+          <div class="summary-row" id="failedCookieSummary" style="display:none;">
+            <span>Cookie 数: <strong id="failedTotal">0</strong></span>
+            <span class="danger">累计失败: <strong id="failedTimes">0</strong></span>
+          </div>
+
+          <div class="key-list" id="failedCookieList"></div>
+        </div>
+
         <div class="health-card">
           <div class="health-title">📊 运行状态</div>
           <div class="kv" id="healthKV">
@@ -315,6 +333,7 @@
       let currentPassword = '';
       let verifyRunning = false;
       let verifyResults = []; // {key, status: 'pending'|'checking'|'alive'|'dead', error:''}
+      let failedCookieItems = []; // {cookie, fail_count}
 
       const fields = {
         admin_password: document.getElementById('admin_password'),
@@ -420,6 +439,90 @@
           html += `</div>`;
           return html;
         }).join('');
+      }
+
+      function renderFailedCookieList() {
+        const list = document.getElementById('failedCookieList');
+        const summary = document.getElementById('failedCookieSummary');
+        const removeBtn = document.getElementById('removeFailedCookiesBtn');
+
+        if (!Array.isArray(failedCookieItems) || failedCookieItems.length === 0) {
+          list.innerHTML = '<div style="color:var(--muted);font-size:0.85rem;text-align:center;padding:20px;">暂无失败记录</div>';
+          summary.style.display = 'none';
+          removeBtn.style.display = 'none';
+          return;
+        }
+
+        const total = failedCookieItems.length;
+        const failedTimes = failedCookieItems.reduce((sum, item) => sum + Number(item.fail_count || 0), 0);
+        document.getElementById('failedTotal').textContent = total;
+        document.getElementById('failedTimes').textContent = failedTimes;
+        summary.style.display = 'flex';
+        removeBtn.style.display = '';
+
+        list.innerHTML = failedCookieItems.map(item => {
+          const failedCount = Number(item.fail_count || 0);
+          let html = '<div class="key-item dead">';
+          html += '<div class="key-top">';
+          html += `<span class="key-text">${maskKey(item.cookie || '')}</span>`;
+          html += `<span class="badge badge-fail">❌ 失败 ${failedCount} 次</span>`;
+          html += '</div>';
+          html += '</div>';
+          return html;
+        }).join('');
+      }
+
+      async function loadFailedCookies(silent = true) {
+        if (!silent) setStatus('warn', '正在加载失败 Cookie 列表...');
+
+        try {
+          const resp = await fetch('/api/onyx-keys/failed', { headers: adminHeaders() });
+          const data = await resp.json();
+
+          if (!resp.ok || !data?.ok) {
+            if (!silent) setStatus('danger', '加载失败 Cookie 列表失败：' + (data?.detail || ''));
+            return;
+          }
+
+          failedCookieItems = Array.isArray(data.items) ? data.items : [];
+          renderFailedCookieList();
+          if (!silent) setStatus('ok', `✅ 已加载 ${failedCookieItems.length} 个失败 Cookie`);
+        } catch (err) {
+          if (!silent) setStatus('danger', '加载失败 Cookie 列表失败：' + err.message);
+        }
+      }
+
+      async function removeAllFailedCookies() {
+        if (!Array.isArray(failedCookieItems) || failedCookieItems.length === 0) {
+          setStatus('warn', '没有失败 Cookie 可删除');
+          return;
+        }
+
+        const toRemove = failedCookieItems.map(item => item.cookie).filter(Boolean);
+        if (!confirm(`确定要一键删除 ${toRemove.length} 个失败 Cookie 吗？`)) return;
+
+        try {
+          const resp = await fetch('/api/onyx-keys/remove-failed', {
+            method: 'POST',
+            headers: { ...adminHeaders() },
+          });
+          const data = await resp.json();
+
+          if (!resp.ok || !data?.ok) {
+            setStatus('danger', '一键删除失败：' + (data?.detail || ''));
+            return;
+          }
+
+          const removedSet = new Set(toRemove);
+          verifyResults = verifyResults.filter(r => !removedSet.has(r.key));
+          renderKeyList();
+
+          await loadConfig();
+          await loadFailedCookies(true);
+          setStatus('ok', `✅ 已删除 ${data.removed} 个失败 Cookie，剩余 ${data.remaining} 个`);
+        } catch (err) {
+          setStatus('danger', '一键删除失败：' + err.message);
+        }
       }
 
       function updateProgress(current, total) {
@@ -659,6 +762,7 @@
           loginOverlay.style.display = 'none';
           mainWrap.style.display = 'block';
           fillForm(result.config || {});
+          await loadFailedCookies(true);
           setStatus('ok', '✅ 配置已加载');
           healthCheck();
         } catch (err) { setLoginStatus('danger', '连接失败：' + err.message); }
@@ -671,6 +775,7 @@
           const data = await resp.json();
           if (!resp.ok) { setStatus('danger', '加载失败：' + (data?.detail || '')); return; }
           fillForm(data.config || {});
+          await loadFailedCookies(true);
           setStatus('ok', '✅ 配置已加载');
         } catch (err) { setStatus('danger', '加载失败：' + err.message); }
       }
@@ -730,11 +835,14 @@
       document.getElementById('verifyAllBtn').addEventListener('click', verifyAll);
       document.getElementById('removeDeadBtn').addEventListener('click', removeAllDead);
       document.getElementById('clearVerifyBtn').addEventListener('click', clearVerify);
+      document.getElementById('refreshFailedCookiesBtn').addEventListener('click', () => loadFailedCookies(false));
+      document.getElementById('removeFailedCookiesBtn').addEventListener('click', removeAllFailedCookies);
       loginPassword.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 
       // 自动登录
       (async function init() {
         renderKeyList();
+        renderFailedCookieList();
         const saved = localStorage.getItem(STORAGE_KEY);
         if (saved) {
           loginPassword.value = saved;
@@ -747,6 +855,7 @@
               loginOverlay.style.display = 'none';
               mainWrap.style.display = 'block';
               fillForm(result.config || {});
+              await loadFailedCookies(true);
               setStatus('ok', '✅ 配置已自动加载');
               healthCheck();
               return;
