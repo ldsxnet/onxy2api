@@ -37,7 +37,7 @@
     MAIL_TIMEOUT_MS: 120000,
     MAIL_POLL_INTERVAL_MS: 3000,
     AGENT_TIMEOUT_MS: 120000,
-    COOKIE_WAIT_TIMEOUT_MS: 120000,
+    COOKIE_WAIT_TIMEOUT_MS: 9000,
     PASSWORD_LENGTH: 16,
     AGENT_NAME_PREFIX: 'Test Agent',
     STATE_MAX_AGE_MS: 30 * 60 * 1000,
@@ -426,6 +426,7 @@
       { url: 'https://cloud.onyx.app', name },
       { domain: 'cloud.onyx.app', name },
       { domain: '.onyx.app', name },
+      { domain: 'onyx.app', name },
       { name },
       {},
     ];

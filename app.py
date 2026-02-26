@@ -95,14 +95,44 @@ class ConfigStore:
         self._cfg = AppConfig()
 
     @staticmethod
-    def _norm_keys(values: list[str]) -> list[str]:
+    def _cookie_identity(cookie: str) -> str:
+        raw = cookie.strip()
+        if not raw:
+            return ""
+
+        pairs: dict[str, str] = {}
+        for piece in raw.split(";"):
+            seg = piece.strip()
+            if not seg or "=" not in seg:
+                continue
+            key, value = seg.split("=", 1)
+            k = key.strip()
+            if not k:
+                continue
+            pairs[k] = value.strip()
+
+        csrf = pairs.get("fastapiusersoauthcsrf", "").strip()
+        if csrf:
+            return f"csrf:{csrf}"
+
+        auth = pairs.get("fastapiusersauth", "").strip()
+        if auth:
+            return f"auth:{auth}"
+
+        return f"raw:{raw}"
+
+    @classmethod
+    def _norm_keys(cls, values: list[str]) -> list[str]:
         out: list[str] = []
         seen: set[str] = set()
         for item in values:
             v = item.strip()
-            if not v or v in seen:
+            if not v:
                 continue
-            seen.add(v)
+            key = cls._cookie_identity(v) or f"raw:{v}"
+            if key in seen:
+                continue
+            seen.add(key)
             out.append(v)
         return out
 
@@ -154,7 +184,10 @@ class ConfigStore:
             v = cookie.strip()
             if not v:
                 raise ValueError("cookie 不能为空")
-            exists = v in self._cfg.onyx_cookies
+
+            incoming_key = self._cookie_identity(v)
+            exists = any(self._cookie_identity(item) == incoming_key for item in self._cfg.onyx_cookies)
+
             if not exists:
                 self._cfg.onyx_cookies.append(v)
                 self._cfg = self._normalize(self._cfg)
@@ -362,7 +395,8 @@ async def refresh_onyx_auth_cookie(cfg: AppConfig, cookie_str: str) -> str:
     req_cookies = _build_onyx_request_cookies(cookie_str)
     auth = req_cookies.get("fastapiusersauth", "").strip()
     csrf = req_cookies.get("fastapiusersoauthcsrf", "").strip()
-    if not auth or not csrf:
+    # 有些场景只有 fastapiusersauth，也允许尝试 refresh
+    if not auth:
         return ""
 
     try:
@@ -387,16 +421,28 @@ async def refresh_onyx_auth_cookie(cfg: AppConfig, cookie_str: str) -> str:
             set_cookie_values = [single]
 
     new_auth = ""
+    new_csrf = ""
     for set_cookie in set_cookie_values:
-        new_auth = _extract_set_cookie_value(set_cookie, "fastapiusersauth")
-        if new_auth:
+        if not new_auth:
+            new_auth = _extract_set_cookie_value(set_cookie, "fastapiusersauth")
+        if not new_csrf:
+            new_csrf = _extract_set_cookie_value(set_cookie, "fastapiusersoauthcsrf")
+        if new_auth and new_csrf:
             break
 
-    if not new_auth:
-        logger.warning("Cookie refresh succeeded but fastapiusersauth not found in set-cookie")
+    final_auth = (new_auth or auth).strip()
+    final_csrf = (new_csrf or csrf).strip()
+
+    if not final_auth:
+        logger.warning("Cookie refresh succeeded but fastapiusersauth is empty after merge")
         return ""
 
-    return _build_cookie_string(new_auth, csrf)
+    refreshed_cookie = _build_cookie_string(final_auth, final_csrf)
+    current_cookie = _build_cookie_string(auth, csrf)
+    if refreshed_cookie == current_cookie:
+        return ""
+
+    return refreshed_cookie
 
 
 async def persist_refreshed_cookie(cfg: AppConfig, old_cookie: str, new_cookie: str) -> None:
