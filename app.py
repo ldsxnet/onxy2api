@@ -271,6 +271,10 @@ class OnyxHTTPError(Exception):
         self.body = body
 
 
+class OnyxUpstreamRejectedError(RuntimeError):
+    pass
+
+
 def gen_id(prefix: str) -> str:
     return f"{prefix}{secrets.token_hex(15)[:29]}"
 
@@ -370,6 +374,19 @@ def _cookie_error_identifier(cookie_str: str) -> str:
         return f"csrf:{csrf}"
     auth = _extract_auth_value(cookie_str).strip()
     return f"auth:{auth}" if auth else ""
+
+
+def is_upstream_rejected_error(message: str) -> bool:
+    msg = str(message or "").strip().lower()
+    if not msg:
+        return False
+
+    # 模糊匹配：避免上游文案有轻微变化
+    if "unexpected error occurred while processing your request" in msg:
+        return True
+    if "unexpected error" in msg and "try again later" in msg:
+        return True
+    return False
 
 
 def build_onyx_headers(cfg: AppConfig, with_json: bool = False) -> dict[str, str]:
@@ -848,6 +865,7 @@ async def do_onyx_request(
             await asyncio.sleep(wait)
             continue
 
+        resp.extensions["onyx_cookie"] = cur_cookie
         clear_cookie_error_count(cur_cookie)
         return resp
 
@@ -901,6 +919,7 @@ async def safe_iter_onyx_events(
                 temp,
                 cfg.default_persona if persona is None else persona,
             )
+            used_cookie = str(resp.extensions.get("onyx_cookie") or cur_cookie)
         except Exception as exc:
             logger.error("do_onyx_request failed on stream attempt %s: %s", stream_attempt + 1, exc)
             if stream_attempt < max_stream_retries - 1:
@@ -910,28 +929,41 @@ async def safe_iter_onyx_events(
 
         has_error = False
         error_msg = ""
+        upstream_rejected = False
 
         async def checked_events() -> AsyncIterator[dict[str, Any]]:
-            nonlocal has_error, error_msg
+            nonlocal has_error, error_msg, upstream_rejected
             async for ev in iter_onyx_events(resp):
                 if ev.get("err"):
                     has_error = True
-                    error_msg = ev["err"]
+                    error_msg = str(ev.get("err") or "")
+                    upstream_rejected = is_upstream_rejected_error(error_msg)
                     logger.error("Stream error on attempt %s: %s", stream_attempt + 1, error_msg)
+                    if upstream_rejected:
+                        raise OnyxUpstreamRejectedError(error_msg)
                     return
+
                 etype = ev.get("type", "")
                 obj = ev.get("obj", {})
                 if etype == "error":
                     has_error = True
-                    error_msg = str(obj.get("error", "Unknown error"))
+                    error_msg = str(obj.get("error") or ev.get("err") or "Unknown error")
+                    upstream_rejected = is_upstream_rejected_error(error_msg)
                     logger.error("Stream error event on attempt %s: %s", stream_attempt + 1, error_msg)
+                    if upstream_rejected:
+                        raise OnyxUpstreamRejectedError(error_msg)
                     return
+
                 yield ev
 
         yield resp, checked_events()
 
         if not has_error:
+            clear_cookie_error_count(used_cookie)
             return
+
+        if upstream_rejected:
+            await mark_cookie_error(cfg, used_cookie, f"upstream rejected stream: {error_msg}")
 
         await resp.aclose()
         logger.warning(
@@ -970,17 +1002,20 @@ def make_chunk(
     }
 
 
-async def stream_openai(resp: httpx.Response, model: str, rid: str) -> AsyncIterator[bytes]:
+async def stream_openai(events: AsyncIterator[dict[str, Any]], model: str, rid: str) -> AsyncIterator[bytes]:
     created = int(time.time())
     sent_role = False
     tool_active = False
 
-    async for ev in iter_onyx_events(resp):
+    async for ev in events:
         etype = ev["type"]
         obj = ev["obj"]
 
         if ev["err"]:
-            logger.error("Stream error (skipped, not sent to client): %s", ev["err"])
+            err_msg = str(ev["err"])
+            logger.error("Stream error (skipped, not sent to client): %s", err_msg)
+            if is_upstream_rejected_error(err_msg):
+                raise OnyxUpstreamRejectedError(err_msg)
             continue
 
         if etype in {"reasoning_start", "reasoning_done", "image_generation_heartbeat"}:
@@ -1171,15 +1206,18 @@ async def stream_openai(resp: httpx.Response, model: str, rid: str) -> AsyncIter
     yield b"data: [DONE]\n\n"
 
 
-async def collect_openai(resp: httpx.Response) -> str:
+async def collect_openai(events: AsyncIterator[dict[str, Any]]) -> str:
     parts: list[str] = []
     tool_ctx: list[str] = []
 
-    async for ev in iter_onyx_events(resp):
+    async for ev in events:
         etype = ev["type"]
         obj = ev["obj"]
         if ev["err"]:
-            logger.error("Collect error (skipped): %s", ev["err"])
+            err_msg = str(ev["err"])
+            logger.error("Collect error (skipped): %s", err_msg)
+            if is_upstream_rejected_error(err_msg):
+                raise OnyxUpstreamRejectedError(err_msg)
             continue
 
         if etype == "message_delta":
@@ -1250,7 +1288,7 @@ def anthropic_sse(event: str, data: Any) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
-async def stream_anthropic(resp: httpx.Response, model: str, rid: str) -> AsyncIterator[bytes]:
+async def stream_anthropic(events: AsyncIterator[dict[str, Any]], model: str, rid: str) -> AsyncIterator[bytes]:
     block_idx = 0
     in_thinking = False
     in_text = False
@@ -1285,7 +1323,7 @@ async def stream_anthropic(resp: httpx.Response, model: str, rid: str) -> AsyncI
     def stop_block() -> bytes:
         return anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": block_idx})
 
-    async for ev in iter_onyx_events(resp):
+    async for ev in events:
         etype = ev["type"]
         obj = ev["obj"]
 
@@ -1898,20 +1936,28 @@ async def handle_openai(req: OpenAIReq, request: Request) -> Any:
     persona = req.persona_id if req.persona_id is not None else cfg.default_persona
     rid = gen_id("chatcmpl-")
 
-    try:
-        resp = await do_onyx_request(cfg, token, model, req.messages, "", temp, persona)
-    except OnyxHTTPError as exc:
-        return JSONResponse(status_code=exc.status, content={"error": str(exc), "detail": exc.body})
-    except Exception as exc:  # noqa: BLE001
-        return JSONResponse(status_code=502, content={"error": str(exc)})
-
     if req.stream:
         async def gen() -> AsyncIterator[bytes]:
-            try:
-                async for chunk in stream_openai(resp, model, rid):
-                    yield chunk
-            finally:
-                await resp.aclose()
+            async for resp, events in safe_iter_onyx_events(
+                cfg,
+                token,
+                model,
+                req.messages,
+                "",
+                temp,
+                persona,
+            ):
+                try:
+                    async for chunk in stream_openai(events, model, rid):
+                        yield chunk
+                    return
+                except OnyxUpstreamRejectedError:
+                    # safe_iter_onyx_events 会负责计数并换 cookie 重试
+                    continue
+                finally:
+                    await resp.aclose()
+
+            raise RuntimeError("All stream retry attempts failed")
 
         return StreamingResponse(
             gen(),
@@ -1924,9 +1970,29 @@ async def handle_openai(req: OpenAIReq, request: Request) -> Any:
         )
 
     try:
-        content = await collect_openai(resp)
-    finally:
-        await resp.aclose()
+        async for resp, events in safe_iter_onyx_events(
+            cfg,
+            token,
+            model,
+            req.messages,
+            "",
+            temp,
+            persona,
+        ):
+            try:
+                content = await collect_openai(events)
+                break
+            except OnyxUpstreamRejectedError:
+                # safe_iter_onyx_events 会负责计数并换 cookie 重试
+                continue
+            finally:
+                await resp.aclose()
+        else:
+            raise RuntimeError("All stream retry attempts failed")
+    except OnyxHTTPError as exc:
+        return JSONResponse(status_code=exc.status, content={"error": str(exc), "detail": exc.body})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"error": str(exc)})
 
     return {
         "id": rid,
@@ -1985,26 +2051,28 @@ async def handle_anthropic(
     system = text_content(req.system)
     rid = gen_id("msg_")
 
-    try:
-        resp = await do_onyx_request(cfg, token, model, req.messages, system, temp, persona)
-    except OnyxHTTPError as exc:
-        return JSONResponse(
-            status_code=exc.status,
-            content={"type": "error", "error": {"type": "api_error", "message": str(exc)}},
-        )
-    except Exception as exc:  # noqa: BLE001
-        return JSONResponse(
-            status_code=502,
-            content={"type": "error", "error": {"type": "api_error", "message": str(exc)}},
-        )
-
     if req.stream:
         async def gen() -> AsyncIterator[bytes]:
-            try:
-                async for chunk in stream_anthropic(resp, model, rid):
-                    yield chunk
-            finally:
-                await resp.aclose()
+            async for resp, events in safe_iter_onyx_events(
+                cfg,
+                token,
+                model,
+                req.messages,
+                system,
+                temp,
+                persona,
+            ):
+                try:
+                    async for chunk in stream_anthropic(events, model, rid):
+                        yield chunk
+                    return
+                except OnyxUpstreamRejectedError:
+                    # safe_iter_onyx_events 会负责计数并换 cookie 重试
+                    continue
+                finally:
+                    await resp.aclose()
+
+            raise RuntimeError("All stream retry attempts failed")
 
         return StreamingResponse(
             gen(),
@@ -2017,9 +2085,35 @@ async def handle_anthropic(
         )
 
     try:
-        text, thinking = await collect_anthropic(resp)
-    finally:
-        await resp.aclose()
+        async for resp, events in safe_iter_onyx_events(
+            cfg,
+            token,
+            model,
+            req.messages,
+            system,
+            temp,
+            persona,
+        ):
+            try:
+                text, thinking = await collect_anthropic(events)
+                break
+            except OnyxUpstreamRejectedError:
+                # safe_iter_onyx_events 会负责计数并换 cookie 重试
+                continue
+            finally:
+                await resp.aclose()
+        else:
+            raise RuntimeError("All stream retry attempts failed")
+    except OnyxHTTPError as exc:
+        return JSONResponse(
+            status_code=exc.status,
+            content={"type": "error", "error": {"type": "api_error", "message": str(exc)}},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(
+            status_code=502,
+            content={"type": "error", "error": {"type": "api_error", "message": str(exc)}},
+        )
 
     content: list[dict[str, Any]] = []
     if thinking:
