@@ -264,18 +264,79 @@ def extract_cookie_source(value: str | None) -> str:
     return s
 
 
+def _split_cookie_pairs(cookie_str: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    for piece in cookie_str.split(";"):
+        seg = piece.strip()
+        if not seg or "=" not in seg:
+            continue
+        key, value = seg.split("=", 1)
+        k = key.strip()
+        v = value.strip()
+        if not k:
+            continue
+        pairs[k] = v
+    return pairs
+
+
 def _extract_auth_value(cookie_str: str) -> str:
     # 兼容完整 Cookie 串或仅 fastapiusersauth 的值
-    if "fastapiusersauth=" in cookie_str:
-        for piece in cookie_str.split(";"):
-            piece = piece.strip()
-            if piece.startswith("fastapiusersauth="):
-                return piece.split("=", 1)[1]
-    return cookie_str.strip()
+    raw = cookie_str.strip()
+    if not raw:
+        return ""
+
+    pairs = _split_cookie_pairs(raw)
+    auth = pairs.get("fastapiusersauth", "").strip()
+    if auth:
+        return auth
+
+    # 兼容旧格式：直接存 fastapiusersauth 的值
+    return raw
+
+
+def _extract_csrf_value(cookie_str: str) -> str:
+    raw = cookie_str.strip()
+    if not raw:
+        return ""
+    return _split_cookie_pairs(raw).get("fastapiusersoauthcsrf", "").strip()
+
+
+def _build_cookie_string(auth_value: str, csrf_value: str = "") -> str:
+    auth = auth_value.strip()
+    csrf = csrf_value.strip()
+    if not auth:
+        return ""
+    if csrf:
+        return f"fastapiusersauth={auth}; fastapiusersoauthcsrf={csrf}"
+    return f"fastapiusersauth={auth}"
+
+
+def _build_onyx_request_cookies(cookie_str: str) -> dict[str, str]:
+    auth = _extract_auth_value(cookie_str)
+    csrf = _extract_csrf_value(cookie_str)
+    out: dict[str, str] = {}
+    if auth:
+        out["fastapiusersauth"] = auth
+    if csrf:
+        out["fastapiusersoauthcsrf"] = csrf
+    return out
+
+
+def _extract_set_cookie_value(set_cookie_header: str, cookie_name: str) -> str:
+    target = f"{cookie_name}="
+    for piece in set_cookie_header.split(";"):
+        seg = piece.strip()
+        if seg.startswith(target):
+            return seg.split("=", 1)[1].strip()
+    return ""
 
 
 def _cookie_error_identifier(cookie_str: str) -> str:
-    return _extract_auth_value(cookie_str).strip()
+    csrf = _extract_csrf_value(cookie_str)
+    if csrf:
+        return f"csrf:{csrf}"
+    auth = _extract_auth_value(cookie_str).strip()
+    return f"auth:{auth}" if auth else ""
 
 
 def build_onyx_headers(cfg: AppConfig, with_json: bool = False) -> dict[str, str]:
@@ -292,6 +353,122 @@ def build_onyx_headers(cfg: AppConfig, with_json: bool = False) -> dict[str, str
     if with_json:
         headers["content-type"] = "application/json"
     return headers
+
+
+async def refresh_onyx_auth_cookie(cfg: AppConfig, cookie_str: str) -> str:
+    if http is None:
+        return ""
+
+    req_cookies = _build_onyx_request_cookies(cookie_str)
+    auth = req_cookies.get("fastapiusersauth", "").strip()
+    csrf = req_cookies.get("fastapiusersoauthcsrf", "").strip()
+    if not auth or not csrf:
+        return ""
+
+    try:
+        response = await http.post(
+            f"{cfg.onyx_base.rstrip('/')}/api/auth/refresh",
+            headers=build_onyx_headers(cfg),
+            cookies=req_cookies,
+            timeout=httpx.Timeout(float(cfg.request_timeout_seconds), connect=20.0),
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("Cookie refresh request failed: %s", exc)
+        return ""
+
+    if response.status_code < 200 or response.status_code >= 300:
+        logger.warning("Cookie refresh failed with HTTP %s", response.status_code)
+        return ""
+
+    set_cookie_values = response.headers.get_list("set-cookie")
+    if not set_cookie_values:
+        single = response.headers.get("set-cookie", "")
+        if single:
+            set_cookie_values = [single]
+
+    new_auth = ""
+    for set_cookie in set_cookie_values:
+        new_auth = _extract_set_cookie_value(set_cookie, "fastapiusersauth")
+        if new_auth:
+            break
+
+    if not new_auth:
+        logger.warning("Cookie refresh succeeded but fastapiusersauth not found in set-cookie")
+        return ""
+
+    return _build_cookie_string(new_auth, csrf)
+
+
+async def persist_refreshed_cookie(cfg: AppConfig, old_cookie: str, new_cookie: str) -> None:
+    old = old_cookie.strip()
+    new_val = new_cookie.strip()
+    if not old or not new_val:
+        return
+
+    if not cfg.onyx_cookies:
+        return
+
+    old_auth = _extract_auth_value(old)
+    old_csrf = _extract_csrf_value(old)
+
+    replaced = False
+    next_cookies: list[str] = []
+    for item in cfg.onyx_cookies:
+        item_auth = _extract_auth_value(item)
+        item_csrf = _extract_csrf_value(item)
+        should_replace = (
+            item == old
+            or (old_csrf and item_csrf == old_csrf)
+            or (old_auth and item_auth == old_auth)
+        )
+
+        if should_replace and not replaced:
+            next_cookies.append(new_val)
+            replaced = True
+            continue
+
+        if should_replace and replaced:
+            continue
+
+        next_cookies.append(item)
+
+    if not replaced:
+        return
+
+    cfg.onyx_cookies = next_cookies
+
+    try:
+        latest = await run_in_threadpool(store.get)
+        latest_auth = _extract_auth_value(old)
+        latest_csrf = _extract_csrf_value(old)
+        merged: list[str] = []
+        merged_replaced = False
+
+        for item in latest.onyx_cookies:
+            item_auth = _extract_auth_value(item)
+            item_csrf = _extract_csrf_value(item)
+            same_cookie = (
+                item == old
+                or (latest_csrf and item_csrf == latest_csrf)
+                or (latest_auth and item_auth == latest_auth)
+            )
+
+            if same_cookie and not merged_replaced:
+                merged.append(new_val)
+                merged_replaced = True
+                continue
+
+            if same_cookie and merged_replaced:
+                continue
+
+            merged.append(item)
+
+        if merged_replaced:
+            latest.onyx_cookies = merged
+            saved = await run_in_threadpool(store.set, latest)
+            cfg.onyx_cookies = saved.onyx_cookies
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Persist refreshed cookie failed: %s", exc)
 
 
 def next_cookie(cookies: list[str]) -> str:
@@ -340,12 +517,18 @@ async def mark_cookie_error(cfg: AppConfig, cookie_str: str, reason: str) -> Non
 
     target = cookie_str.strip()
     target_auth = _extract_auth_value(cookie_str)
+    target_csrf = _extract_csrf_value(cookie_str)
     kept_cookies: list[str] = []
     removed_count = 0
 
     for item in cur_cfg.onyx_cookies:
         item_auth = _extract_auth_value(item)
-        if item == target or (target_auth and item_auth == target_auth):
+        item_csrf = _extract_csrf_value(item)
+        if (
+            item == target
+            or (target_csrf and item_csrf == target_csrf)
+            or (target_auth and item_auth == target_auth)
+        ):
             removed_count += 1
             continue
         kept_cookies.append(item)
@@ -477,15 +660,19 @@ def messages_to_onyx(system: str, msgs: list[ChatMsg]) -> str:
     return "\n".join(out).strip()
 
 
-async def create_chat_session(cfg: AppConfig, auth_cookie: str, persona: int) -> str:
+async def create_chat_session(cfg: AppConfig, auth_cookie: str, persona: int) -> tuple[str, str]:
     if http is None:
         raise RuntimeError("HTTP client is not initialized")
+
+    refreshed_cookie = await refresh_onyx_auth_cookie(cfg, auth_cookie)
+    effective_cookie = refreshed_cookie or auth_cookie
+    req_cookies = _build_onyx_request_cookies(effective_cookie)
 
     response = await http.post(
         f"{cfg.onyx_base.rstrip('/')}/api/chat/create-chat-session",
         headers=build_onyx_headers(cfg, with_json=True),
         json={"persona_id": persona, "description": None, "project_id": None},
-        cookies={"fastapiusersauth": _extract_auth_value(auth_cookie)},
+        cookies=req_cookies,
         timeout=httpx.Timeout(float(cfg.request_timeout_seconds), connect=30.0),
     )
     if response.status_code == 401:
@@ -497,7 +684,11 @@ async def create_chat_session(cfg: AppConfig, auth_cookie: str, persona: int) ->
     chat_session_id = data.get("chat_session_id") or data.get("id")
     if not chat_session_id:
         raise RuntimeError(f"create-chat-session missing chat_session_id: {data}")
-    return str(chat_session_id)
+
+    if refreshed_cookie:
+        await persist_refreshed_cookie(cfg, auth_cookie, refreshed_cookie)
+
+    return str(chat_session_id), effective_cookie
 
 
 async def do_onyx_request(
@@ -533,7 +724,7 @@ async def do_onyx_request(
             )
 
         try:
-            chat_session_id = await create_chat_session(cfg, cur_cookie, persona)
+            chat_session_id, effective_cookie = await create_chat_session(cfg, cur_cookie, persona)
             body = {
                 "message": messages_to_onyx(system, msgs),
                 "chat_session_id": chat_session_id,
@@ -556,7 +747,7 @@ async def do_onyx_request(
                 f"{cfg.onyx_base.rstrip('/')}/api/chat/send-chat-message",
                 json=body,
                 headers=build_onyx_headers(cfg, with_json=True),
-                cookies={"fastapiusersauth": _extract_auth_value(cur_cookie)},
+                cookies=_build_onyx_request_cookies(effective_cookie),
                 timeout=httpx.Timeout(float(cfg.request_timeout_seconds), connect=30.0),
             )
             resp = await http.send(req, stream=True)
@@ -1408,7 +1599,7 @@ async def verify_onyx_cookie(payload: VerifyCookieReq, request: Request) -> dict
         raise HTTPException(status_code=500, detail="HTTP client not initialized")
 
     try:
-        chat_session_id = await create_chat_session(cfg, cookie, cfg.default_persona)
+        chat_session_id, effective_cookie = await create_chat_session(cfg, cookie, cfg.default_persona)
         body = {
             "message": "Hi",
             "chat_session_id": chat_session_id,
@@ -1431,7 +1622,7 @@ async def verify_onyx_cookie(payload: VerifyCookieReq, request: Request) -> dict
             f"{cfg.onyx_base.rstrip('/')}/api/chat/send-chat-message",
             json=body,
             headers=build_onyx_headers(cfg, with_json=True),
-            cookies={"fastapiusersauth": _extract_auth_value(cookie)},
+            cookies=_build_onyx_request_cookies(effective_cookie),
             timeout=httpx.Timeout(30.0, connect=10.0),
         )
         resp = await http.send(req, stream=True)

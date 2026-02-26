@@ -418,12 +418,15 @@
     }, delay);
   }
 
-  async function getFastapiUsersAuthCookieOnce() {
+  async function getCookieValueOnce(cookieName) {
+    const name = String(cookieName || '').trim();
+    if (!name) return '';
+
     const queries = [
-      { url: 'https://cloud.onyx.app', name: 'fastapiusersauth' },
-      { domain: 'cloud.onyx.app', name: 'fastapiusersauth' },
-      { domain: '.onyx.app', name: 'fastapiusersauth' },
-      { name: 'fastapiusersauth' },
+      { url: 'https://cloud.onyx.app', name },
+      { domain: 'cloud.onyx.app', name },
+      { domain: '.onyx.app', name },
+      { name },
       {},
     ];
 
@@ -437,7 +440,7 @@
 
       const match = items.find((item) => {
         if (!item || typeof item !== 'object') return false;
-        if (String(item.name || '') !== 'fastapiusersauth') return false;
+        if (String(item.name || '') !== name) return false;
 
         const value = String(item.value || '').trim();
         if (!value) return false;
@@ -456,14 +459,45 @@
     return '';
   }
 
-  async function waitForFastapiUsersAuthCookie(timeoutMs = 120000) {
+  async function waitForOnyxAuthCookies(timeoutMs = 120000) {
     const start = Date.now();
+    let authValue = '';
+    let csrfValue = '';
+
     while (Date.now() - start < timeoutMs) {
-      const value = await getFastapiUsersAuthCookieOnce();
-      if (value) return value;
+      if (!authValue) authValue = await getCookieValueOnce('fastapiusersauth');
+      if (!csrfValue) csrfValue = await getCookieValueOnce('fastapiusersoauthcsrf');
+
+      if (authValue && csrfValue) {
+        return {
+          fastapiusersauth: authValue,
+          fastapiusersoauthcsrf: csrfValue,
+          complete: true,
+        };
+      }
+
+      if (authValue && !csrfValue) {
+        // 已拿到 auth，继续短暂等待 csrf，超时后仍可回退为旧格式
+        await sleep(600);
+        continue;
+      }
+
       await sleep(600);
     }
-    return '';
+
+    return {
+      fastapiusersauth: authValue,
+      fastapiusersoauthcsrf: csrfValue,
+      complete: Boolean(authValue && csrfValue),
+    };
+  }
+
+  function buildOnyxCookieString(authValue, csrfValue) {
+    const auth = String(authValue || '').trim();
+    const csrf = String(csrfValue || '').trim();
+    if (!auth) return '';
+    if (csrf) return `fastapiusersauth=${auth}; fastapiusersoauthcsrf=${csrf}`;
+    return `fastapiusersauth=${auth}`;
   }
 
   async function appendCookieToServer(cookieValue) {
@@ -475,7 +509,7 @@
 
     const cookie = String(cookieValue || '').trim();
     if (!cookie) {
-      throw new Error('append 失败：fastapiusersauth 为空');
+      throw new Error('append 失败：cookie 为空');
     }
 
     if (!appendCfg.url || !appendCfg.adminPassword) {
@@ -853,6 +887,17 @@
     }
   }
 
+  function getRegisterErrorMessage() {
+    const el = document.querySelector('.font-secondary-body.text-text-03.ml-0\\.5');
+    if (!el) return '';
+    return String(el.textContent || el.innerText || '').trim();
+  }
+
+  function isNonRetryableRegisterError(message) {
+    const text = normalizeText(message);
+    return text.includes('account already exists');
+  }
+
   function interceptNextRegisterResponse(timeoutMs = 120000) {
     return new Promise((resolve) => {
       const originalFetch = window.fetch;
@@ -918,9 +963,13 @@
         const curHref = getCurrentHref();
         const path = getCurrentPath();
 
+        const redirectedToLogin = path.startsWith('/auth/login');
+        if (redirectedToLogin) {
+          return { ok: false, reason: 'redirected_to_login' };
+        }
+
         const navigated = curHref !== beforeHref
           || path.startsWith('/auth/waiting-on-verification')
-          || path.startsWith('/auth/login')
           || path.startsWith('/app')
           || path.startsWith('/auth/verify-email');
         if (navigated) {
@@ -963,6 +1012,37 @@
           onSuccess({ is_active: true, email: expectedEmail, detectedBy: result.reason });
         }
         return true;
+      }
+
+      if (result.reason === 'redirected_to_login') {
+        const fullAutoEnabled = isFullAutoEnabled();
+        warn('注册失败：提交后跳转到 /auth/login');
+
+        if (fullAutoEnabled) {
+          clearState();
+          log('已启用全自动循环：将自动跳回注册页重新开始');
+          scheduleFullAutoRestartToSignup();
+        }
+
+        throw new Error('注册失败：提交后跳转到登录页');
+      }
+
+      const registerErrorMessage = getRegisterErrorMessage();
+      if (registerErrorMessage) {
+        warn(`注册失败提示: ${registerErrorMessage}`);
+      }
+
+      if (isNonRetryableRegisterError(registerErrorMessage)) {
+        const fullAutoEnabled = isFullAutoEnabled();
+        warn(`注册失败：命中不可重试错误（account already exists）: ${registerErrorMessage}`);
+
+        if (fullAutoEnabled) {
+          clearState();
+          log('已启用全自动循环：检测到不可重试错误，刷新页面重新开始注册');
+          setTimeout(() => window.location.reload(), 120);
+        }
+
+        throw new Error(`注册失败（不可重试）: ${registerErrorMessage}`);
       }
 
       warn(`注册失败，准备重试：${result.reason}`);
@@ -1102,24 +1182,31 @@
   }
 
   async function reportCookieOnCurrentPage(state) {
-    log('开始读取并上报 fastapiusersauth Cookie...');
+    log('开始读取并上报 Onyx Cookie（fastapiusersauth + fastapiusersoauthcsrf）...');
     saveState({ phase: 'post_verify_reporting_cookie' });
 
-    const cookieValue = await waitForFastapiUsersAuthCookie(CONFIG.COOKIE_WAIT_TIMEOUT_MS);
-    if (!cookieValue) {
+    const cookieInfo = await waitForOnyxAuthCookies(CONFIG.COOKIE_WAIT_TIMEOUT_MS);
+    const authValue = String(cookieInfo.fastapiusersauth || '').trim();
+    const csrfValue = String(cookieInfo.fastapiusersoauthcsrf || '').trim();
+
+    if (!authValue) {
       throw new Error('未在超时时间内读取到 fastapiusersauth Cookie');
     }
 
+    const cookieString = buildOnyxCookieString(authValue, csrfValue);
+
     let appendResult = null;
     try {
-      appendResult = await appendCookieToServer(cookieValue);
+      appendResult = await appendCookieToServer(cookieString);
     } catch (e) {
       warn('Cookie 自动上报失败（本地已读取到 cookie）:', e);
     }
 
     saveLastRegisteredAccount({
-      fastapiusersauth: cookieValue,
-      cookie: `fastapiusersauth=${cookieValue}`,
+      fastapiusersauth: authValue,
+      fastapiusersoauthcsrf: csrfValue || null,
+      cookie: cookieString,
+      cookie_format: csrfValue ? 'dual' : 'legacy_single',
       agentName: state.agentName || null,
       assistantId: state.assistantId || null,
       appendResult,
@@ -1131,7 +1218,9 @@
 
     saveState({
       phase: 'post_verify_done',
-      fastapiusersauth: cookieValue,
+      fastapiusersauth: authValue,
+      fastapiusersoauthcsrf: csrfValue || null,
+      cookie: cookieString,
       appendResult,
       completedAt: Date.now(),
       fullAutoEnabled,
@@ -1145,13 +1234,13 @@
       }
 
       clearState();
-      log(`Cookie 上报成功，已进入全自动重启流程: ${cookieValue.slice(0, 12)}...`);
+      log(`Cookie 上报成功，已进入全自动重启流程: ${authValue.slice(0, 12)}...`);
       scheduleFullAutoRestartToSignup();
       return true;
     }
 
     clearState();
-    log(`Cookie 上报流程完成: ${cookieValue.slice(0, 12)}...`);
+    log(`Cookie 上报流程完成: ${authValue.slice(0, 12)}...`);
     return true;
   }
 
