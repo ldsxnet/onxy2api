@@ -1302,65 +1302,83 @@
     log('开始执行验证后流程：先上报 Cookie，再创建 Agent...');
 
     const cookieResult = await reportCookieOnCurrentPage(state);
+    const fullAutoEnabled = isFullAutoEnabled();
 
     const agentName = state.agentName || makeAgentName();
-    saveState({ phase: 'post_verify_creating_agent', agentName });
+    let assistantId = null;
+    let agentCreated = false;
+    let agentError = null;
 
-    const nameInput = await waitForElement("input[name='name'], input[placeholder*='Agent'], input[aria-label*='Agent']", CONFIG.AGENT_TIMEOUT_MS);
-    if (!nameInput) {
-      throw new Error('创建 Agent 失败：未找到名称输入框');
+    try {
+      saveState({ phase: 'post_verify_creating_agent', agentName });
+
+      const nameInput = await waitForElement("input[name='name'], input[placeholder*='Agent'], input[aria-label*='Agent']", CONFIG.AGENT_TIMEOUT_MS);
+      if (!nameInput) {
+        throw new Error('创建 Agent 失败：未找到名称输入框');
+      }
+
+      await typeLikeHuman(nameInput, agentName, 40, 120);
+      await sleep(randInt(140, 340));
+
+      let submitBtn = document.querySelector("button[type='submit']");
+      if (!submitBtn || submitBtn.disabled) {
+        submitBtn = findButtonByText(['create', '创建']);
+      }
+      if (!submitBtn) {
+        throw new Error('创建 Agent 失败：未找到提交按钮');
+      }
+
+      submitBtn.click();
+      log(`已提交 Agent 创建: ${agentName}`);
+
+      const successHref = await waitForCondition(() => {
+        const href = getCurrentHref();
+        if (href.includes('/app?assistantId=')) return href;
+        return null;
+      }, CONFIG.AGENT_TIMEOUT_MS, 250);
+
+      if (!successHref) {
+        throw new Error('创建 Agent 后未跳转到 /app?assistantId=...');
+      }
+
+      assistantId = extractAssistantIdFromHref(successHref);
+      agentCreated = true;
+      log(`Agent 创建成功: name=${agentName}, assistantId=${assistantId || 'unknown'}`);
+    } catch (e) {
+      agentError = String(e);
+      warn('创建 Agent 失败（Cookie 已上报）:', e);
+
+      if (!fullAutoEnabled) {
+        throw e;
+      }
     }
 
-    await typeLikeHuman(nameInput, agentName, 40, 120);
-    await sleep(randInt(140, 340));
-
-    let submitBtn = document.querySelector("button[type='submit']");
-    if (!submitBtn || submitBtn.disabled) {
-      submitBtn = findButtonByText(['create', '创建']);
-    }
-    if (!submitBtn) {
-      throw new Error('创建 Agent 失败：未找到提交按钮');
-    }
-
-    submitBtn.click();
-    log(`已提交 Agent 创建: ${agentName}`);
-
-    const successHref = await waitForCondition(() => {
-      const href = getCurrentHref();
-      if (href.includes('/app?assistantId=')) return href;
-      return null;
-    }, CONFIG.AGENT_TIMEOUT_MS, 250);
-
-    if (!successHref) {
-      throw new Error('创建 Agent 后未跳转到 /app?assistantId=...');
-    }
-
-    const assistantId = extractAssistantIdFromHref(successHref);
     saveLastRegisteredAccount({
       fastapiusersauth: cookieResult.authValue,
       fastapiusersoauthcsrf: cookieResult.csrfValue || null,
       cookie: cookieResult.cookieString,
       cookie_format: cookieResult.csrfValue ? 'dual' : 'legacy_single',
       appendResult: cookieResult.appendResult,
-      agentName,
+      agentName: agentCreated ? agentName : null,
       assistantId: assistantId || null,
+      agentCreated,
+      agentError,
       postVerifiedAt: Date.now(),
     });
 
-    const fullAutoEnabled = isFullAutoEnabled();
     saveState({
       phase: 'post_verify_done',
       fastapiusersauth: cookieResult.authValue,
       fastapiusersoauthcsrf: cookieResult.csrfValue || null,
       cookie: cookieResult.cookieString,
       appendResult: cookieResult.appendResult,
-      agentName,
+      agentName: agentCreated ? agentName : null,
       assistantId: assistantId || null,
+      agentCreated,
+      agentError,
       completedAt: Date.now(),
       fullAutoEnabled,
     });
-
-    log(`Agent 创建成功: name=${agentName}, assistantId=${assistantId || 'unknown'}`);
 
     if (fullAutoEnabled) {
       try {
@@ -1369,7 +1387,11 @@
         warn('全自动模式：Cookie 清理失败，将继续跳回注册页:', e);
       }
       clearState();
-      log('验证后流程完成（已上报 Cookie + 已创建 Agent），全自动模式将回到注册页继续');
+      if (agentCreated) {
+        log('验证后流程完成（已上报 Cookie + 已创建 Agent），全自动模式将回到注册页继续');
+      } else {
+        log('验证后流程完成（已上报 Cookie，Agent 创建失败已忽略），全自动模式将回到注册页继续');
+      }
       scheduleFullAutoRestartToSignup();
       return true;
     }
