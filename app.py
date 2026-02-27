@@ -18,7 +18,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import AliasChoices, BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-VERSION = "0.5.0-py"
+VERSION = "0.6.0-py"
 ONYX_BASE_URL = os.getenv("ONYX_BASE_URL", "https://cloud.onyx.app").rstrip("/")
 ONYX_AUTH_COOKIE = os.getenv("ONYX_AUTH_COOKIE", "")
 ONYX_PERSONA_ID = int(os.getenv("ONYX_PERSONA_ID", "0"))
@@ -317,11 +317,10 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 http: httpx.AsyncClient | None = None
 
-
 @app.on_event("startup")
 async def on_startup() -> None:
     global http
-    limits = httpx.Limits(max_connections=200, max_keepalive_connections=100)
+    limits = httpx.Limits(max_connections=500, max_keepalive_connections=100, keepalive_expiry=30.0)
     http = httpx.AsyncClient(http2=True, limits=limits)
     cfg = store.get()
     logger.info("管理页面密码：admin_password=%s", cfg.admin_password)
