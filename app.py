@@ -29,6 +29,8 @@ MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 5, 10]
 RETRY_STATUS = {502, 503, 504, 429, 401, 403}
 ONYX_COOKIE_ERROR_LIMIT = max(int(os.getenv("ONYX_COOKIE_ERROR_LIMIT", "3")), 1)
+CONFIG_FILE_PATH = "/data/config.json"
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("onyx2api")
@@ -150,7 +152,7 @@ class ConfigStore:
         if not cfg.onyx_base.strip():
             cfg.onyx_base = ONYX_BASE_DEFAULT
         if not cfg.admin_password.strip():
-            cfg.admin_password = generate_admin_password()
+            cfg.admin_password = ADMIN_PASSWORD if ADMIN_PASSWORD else generate_admin_password()
         return cfg
 
     def load(self) -> None:
@@ -220,7 +222,16 @@ class AnthropicReq(BaseModel):
 
 
 BASE_DIR = Path(__file__).resolve().parent
-store = ConfigStore(BASE_DIR / "config.json")
+
+# Make config path absolute if it's not already
+config_path_obj = Path(CONFIG_FILE_PATH)
+if not config_path_obj.is_absolute():
+    config_path_obj = BASE_DIR / config_path_obj
+
+# Ensure the directory exists (e.g. /data)
+config_path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+store = ConfigStore(config_path_obj)
 store.load()
 
 app = FastAPI(title="onyx2api-py", version=VERSION)
