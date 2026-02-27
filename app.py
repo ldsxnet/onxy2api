@@ -29,6 +29,11 @@ MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 5, 10]
 RETRY_STATUS = {502, 503, 504, 429, 401, 403}
 ONYX_COOKIE_ERROR_LIMIT = max(int(os.getenv("ONYX_COOKIE_ERROR_LIMIT", "3")), 1)
+ONYX_MAX_TOTAL_ATTEMPTS = max(int(os.getenv("ONYX_MAX_TOTAL_ATTEMPTS", "6")), 1)
+ONYX_MAX_STREAM_RETRIES = max(int(os.getenv("ONYX_MAX_STREAM_RETRIES", "3")), 1)
+ONYX_RETRY_BUDGET_SECONDS = max(float(os.getenv("ONYX_RETRY_BUDGET_SECONDS", "110")), 10.0)
+ONYX_UPSTREAM_READ_TIMEOUT_SECONDS = max(float(os.getenv("ONYX_UPSTREAM_READ_TIMEOUT_SECONDS", "110")), 10.0)
+ONYX_HTTP2_ENABLED = os.getenv("ONYX_HTTP2_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("onyx2api")
@@ -320,10 +325,11 @@ http: httpx.AsyncClient | None = None
 @app.on_event("startup")
 async def on_startup() -> None:
     global http
-    limits = httpx.Limits(max_connections=500, max_keepalive_connections=100, keepalive_expiry=30.0)
-    http = httpx.AsyncClient(http2=True, limits=limits)
+    limits = httpx.Limits(max_connections=200, max_keepalive_connections=50, keepalive_expiry=15.0)
+    http = httpx.AsyncClient(http2=ONYX_HTTP2_ENABLED, limits=limits)
     cfg = store.get()
     logger.info("管理页面密码：admin_password=%s", cfg.admin_password)
+    logger.info("Onyx upstream http2=%s | max_conn=%s | max_keepalive=%s", ONYX_HTTP2_ENABLED, 200, 50)
 
 
 @app.on_event("shutdown")
@@ -471,6 +477,13 @@ def is_upstream_rejected_error(message: str) -> bool:
     if "unexpected error" in msg and "try again later" in msg:
         return True
     return False
+
+
+def should_count_cookie_error(exc: Exception) -> bool:
+    # 网络层/传输层异常不应算作 Cookie 失效
+    if isinstance(exc, httpx.RequestError):
+        return False
+    return True
 
 
 def build_onyx_headers(cfg: AppConfig, with_json: bool = False) -> dict[str, str]:
@@ -909,10 +922,15 @@ async def do_onyx_request(
         raise RuntimeError("HTTP client is not initialized")
 
     total_cookies = max(len(cfg.onyx_cookies), 1)
-    max_attempts = total_cookies * MAX_RETRIES
+    max_attempts = min(total_cookies * MAX_RETRIES, ONYX_MAX_TOTAL_ATTEMPTS)
+    started_at = time.monotonic()
     last_err: Exception | None = None
 
     for attempt in range(max_attempts):
+        elapsed = time.monotonic() - started_at
+        if elapsed >= ONYX_RETRY_BUDGET_SECONDS:
+            break
+
         current_total = max(len(cfg.onyx_cookies), 1)
         cur_ref = cookie_ref if attempt == 0 else (next_cookie(cfg.onyx_cookies) if cfg.onyx_cookies else cookie_ref)
         cookie_idx = attempt % current_total
@@ -951,21 +969,29 @@ async def do_onyx_request(
                 "origin": ONYX_ORIGIN,
             }
 
+            read_timeout = min(float(cfg.request_timeout_seconds), ONYX_UPSTREAM_READ_TIMEOUT_SECONDS)
             req = http.build_request(
                 "POST",
                 f"{cfg.onyx_base.rstrip('/')}/api/chat/send-chat-message",
                 json=body,
                 headers=build_onyx_headers(cfg, with_json=True),
                 cookies=_build_onyx_request_cookies(active_cookie),
-                timeout=httpx.Timeout(float(cfg.request_timeout_seconds), connect=30.0),
+                timeout=httpx.Timeout(read_timeout, connect=30.0),
             )
             resp = await http.send(req, stream=True)
         except (httpx.HTTPError, RuntimeError) as exc:
             last_err = exc
-            await mark_cookie_error(cfg, active_ref, str(exc))
+            if should_count_cookie_error(exc):
+                await mark_cookie_error(cfg, active_ref, str(exc))
+            else:
+                logger.warning("Network error not counted as cookie failure: %s", exc)
             wait = RETRY_BACKOFF[min(round_num, len(RETRY_BACKOFF) - 1)]
-            logger.warning("Attempt %s failed (%s), retry in %ss", attempt + 1, exc, wait)
-            await asyncio.sleep(wait)
+            remain = ONYX_RETRY_BUDGET_SECONDS - (time.monotonic() - started_at)
+            if remain <= 0:
+                break
+            sleep_for = min(wait, remain)
+            logger.warning("Attempt %s failed (%s), retry in %.1fs", attempt + 1, exc, sleep_for)
+            await asyncio.sleep(sleep_for)
             continue
 
         if resp.status_code != 200:
@@ -981,8 +1007,12 @@ async def do_onyx_request(
             last_err = OnyxHTTPError(status, body_text)
             await mark_cookie_error(cfg, active_ref, f"HTTP {status}")
             wait = RETRY_BACKOFF[min(round_num, len(RETRY_BACKOFF) - 1)]
-            logger.warning("Attempt %s failed (HTTP %s), trying next cookie in %ss", attempt + 1, status, wait)
-            await asyncio.sleep(wait)
+            remain = ONYX_RETRY_BUDGET_SECONDS - (time.monotonic() - started_at)
+            if remain <= 0:
+                break
+            sleep_for = min(wait, remain)
+            logger.warning("Attempt %s failed (HTTP %s), trying next cookie in %.1fs", attempt + 1, status, sleep_for)
+            await asyncio.sleep(sleep_for)
             continue
 
         resp.extensions["onyx_cookie_ref"] = active_ref
@@ -990,7 +1020,9 @@ async def do_onyx_request(
         clear_cookie_error_count(active_ref)
         return resp
 
-    raise last_err if last_err is not None else RuntimeError("all retries failed")
+    if last_err is not None:
+        raise RuntimeError(f"retry budget exceeded ({ONYX_RETRY_BUDGET_SECONDS:.0f}s): {last_err}") from last_err
+    raise RuntimeError("all retries failed")
 
 async def iter_onyx_events(resp: httpx.Response) -> AsyncIterator[dict[str, Any]]:
     async for line in resp.aiter_lines():
@@ -1025,9 +1057,14 @@ async def safe_iter_onyx_events(
 ) -> AsyncIterator[tuple[httpx.Response, AsyncIterator[dict[str, Any]]]]:
     """包装 iter_onyx_events，遇到流式错误自动换 cookie 重试"""
     total_cookies = max(len(cfg.onyx_cookies), 1)
-    max_stream_retries = total_cookies * 2
+    max_stream_retries = min(total_cookies * 2, ONYX_MAX_STREAM_RETRIES)
+    started_at = time.monotonic()
 
     for stream_attempt in range(max_stream_retries):
+        elapsed = time.monotonic() - started_at
+        if elapsed >= ONYX_RETRY_BUDGET_SECONDS:
+            break
+
         cur_ref = cookie_ref if stream_attempt == 0 else (next_cookie(cfg.onyx_cookies) if cfg.onyx_cookies else cookie_ref)
 
         try:
@@ -1044,7 +1081,10 @@ async def safe_iter_onyx_events(
         except Exception as exc:
             logger.error("do_onyx_request failed on stream attempt %s: %s", stream_attempt + 1, exc)
             if stream_attempt < max_stream_retries - 1:
-                await asyncio.sleep(2)
+                remain = ONYX_RETRY_BUDGET_SECONDS - (time.monotonic() - started_at)
+                if remain <= 0:
+                    break
+                await asyncio.sleep(min(2.0, remain))
                 continue
             raise
 
@@ -1093,9 +1133,12 @@ async def safe_iter_onyx_events(
             max_stream_retries,
             error_msg,
         )
-        await asyncio.sleep(2)
+        remain = ONYX_RETRY_BUDGET_SECONDS - (time.monotonic() - started_at)
+        if remain <= 0:
+            break
+        await asyncio.sleep(min(2.0, remain))
 
-    raise RuntimeError("All stream retry attempts failed")
+    raise RuntimeError("All stream retry attempts failed within retry budget")
 
 def sse(data: Any) -> bytes:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
