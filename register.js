@@ -34,6 +34,7 @@
     AUTO_START: true,
     MAX_REGISTER_RETRY: 9,
     REGISTER_TIMEOUT_MS: 120000,
+    PAGE_STUCK_TIMEOUT_MS: 180000,
     MAIL_TIMEOUT_MS: 120000,
     MAIL_POLL_INTERVAL_MS: 3000,
     AGENT_TIMEOUT_MS: 120000,
@@ -55,6 +56,10 @@
   const STORAGE_KEY = 'onyx_auto_register_state_v1';
   const LAST_ACCOUNT_KEY = 'onyx_last_registered_account';
   const FULL_AUTO_ENABLED_KEY = 'onyx_full_auto_enabled_v1';
+  const PAGE_STUCK_GUARD_KEY = 'onyx_page_stuck_guard_v1';
+
+  let pageStuckTimer = null;
+  let pageStuckHandling = false;
 
   function loadState() {
     try {
@@ -78,6 +83,7 @@
 
   function clearState() {
     localStorage.removeItem(STORAGE_KEY);
+    clearPageStuckGuard();
   }
 
   function loadLastRegisteredAccount() {
@@ -118,6 +124,148 @@
 
   function isFullAutoEnabled() {
     return loadFullAutoEnabled();
+  }
+
+  function isFlowInProgressPhase(phase) {
+    return [
+      'form_filling',
+      'register_submitted',
+      'waiting_email',
+      'verified_link_found',
+      'post_verify_pending',
+      'post_verify_open_agent_page',
+      'post_verify_creating_agent',
+      'post_verify_reporting_cookie',
+      // 兼容旧阶段名
+      'post_verify_open_api_key_page',
+      'post_verify_creating_api_key',
+    ].includes(String(phase || ''));
+  }
+
+  function loadPageStuckGuard() {
+    try {
+      const raw = localStorage.getItem(PAGE_STUCK_GUARD_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (!parsed || typeof parsed !== 'object') return null;
+
+      const startedAt = Number(parsed.startedAt || 0);
+      const timeoutMs = Math.max(1000, Number(parsed.timeoutMs || CONFIG.PAGE_STUCK_TIMEOUT_MS || 180000));
+      const source = String(parsed.source || 'unknown');
+      const href = String(parsed.href || '');
+      if (!startedAt) return null;
+
+      return { startedAt, timeoutMs, source, href };
+    } catch {
+      return null;
+    }
+  }
+
+  function savePageStuckGuard(data = {}) {
+    const timeoutMs = Math.max(1000, Number(data.timeoutMs || CONFIG.PAGE_STUCK_TIMEOUT_MS || 180000));
+    const startedAt = Number(data.startedAt || Date.now());
+    const source = String(data.source || 'unknown');
+    const href = String(data.href || getCurrentHref());
+    const next = { startedAt, timeoutMs, source, href };
+    localStorage.setItem(PAGE_STUCK_GUARD_KEY, JSON.stringify(next));
+    return next;
+  }
+
+  function clearPageStuckGuard() {
+    if (pageStuckTimer) {
+      clearTimeout(pageStuckTimer);
+      pageStuckTimer = null;
+    }
+    pageStuckHandling = false;
+    localStorage.removeItem(PAGE_STUCK_GUARD_KEY);
+  }
+
+  async function handlePageStuckTimeout(reason = 'timer') {
+    if (pageStuckHandling) return false;
+    pageStuckHandling = true;
+
+    const guard = loadPageStuckGuard();
+    const timeoutMs = Math.max(1000, Number((guard && guard.timeoutMs) || CONFIG.PAGE_STUCK_TIMEOUT_MS || 180000));
+    const timeoutSeconds = (timeoutMs / 1000).toFixed(0);
+
+    warn(`检测到流程卡住超过 ${timeoutSeconds} 秒（${reason}），判定注册失败`);
+
+    const fullAutoEnabled = isFullAutoEnabled();
+    if (fullAutoEnabled) {
+      try {
+        await clearAllCookiesForCurrentSite();
+      } catch (e) {
+        warn('全自动模式：页面卡住超时后清理 Cookie 失败，将继续跳回注册页:', e);
+      }
+    }
+
+    clearState();
+    running = false;
+
+    const btn = document.getElementById('onyx-auto-register-btn');
+    if (btn) {
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      btn.style.cursor = 'pointer';
+      btn.textContent = '开始注册';
+    }
+
+    if (fullAutoEnabled) {
+      log('已启用全自动循环：任意页面卡住超时，清理 Cookie 后跳回注册页重新开始');
+      scheduleFullAutoRestartToSignup();
+      return true;
+    }
+
+    err(`注册流程失败：页面卡住超过 ${timeoutSeconds} 秒`);
+    return false;
+  }
+
+  function ensurePageStuckGuardActive(source = 'unknown') {
+    let guard = loadPageStuckGuard();
+    const timeoutMs = Math.max(1000, Number(CONFIG.PAGE_STUCK_TIMEOUT_MS || 180000));
+    const currentHref = getCurrentHref();
+
+    if (!guard) {
+      guard = savePageStuckGuard({ startedAt: Date.now(), timeoutMs, source, href: currentHref });
+      log(`已启动页面卡住监控（来源=${source}，超时=${(timeoutMs / 1000).toFixed(0)}秒）`);
+    } else if (String(guard.href || '') !== currentHref) {
+      // 已进入新页面：按“单页面卡住超时”语义重置计时
+      guard = savePageStuckGuard({ startedAt: Date.now(), timeoutMs, source: `page_changed:${source}`, href: currentHref });
+      log(`检测到页面变化，重置卡住监控计时（超时=${(timeoutMs / 1000).toFixed(0)}秒）`);
+    }
+
+    if (pageStuckTimer) {
+      clearTimeout(pageStuckTimer);
+      pageStuckTimer = null;
+    }
+
+    const elapsed = Date.now() - Number(guard.startedAt || Date.now());
+    const remainMs = Number(guard.timeoutMs || timeoutMs) - elapsed;
+
+    if (remainMs <= 0) {
+      handlePageStuckTimeout('guard_elapsed_before_arm').catch((e) => err('处理页面卡住超时失败:', e));
+      return;
+    }
+
+    pageStuckTimer = setTimeout(() => {
+      handlePageStuckTimeout('guard_timer_fired').catch((e) => err('处理页面卡住超时失败:', e));
+    }, remainMs);
+  }
+
+  function startNewPageStuckGuard(source = 'unknown') {
+    clearPageStuckGuard();
+    savePageStuckGuard({ startedAt: Date.now(), timeoutMs: CONFIG.PAGE_STUCK_TIMEOUT_MS, source });
+    ensurePageStuckGuardActive(source);
+  }
+
+  function restorePageStuckGuardFromStateIfNeeded() {
+    const state = loadState();
+    if (!state || !isStateFresh(state) || !isFlowInProgressPhase(state.phase)) {
+      clearPageStuckGuard();
+      return false;
+    }
+
+    ensurePageStuckGuardActive(`restore:${String(state.phase || 'unknown')}`);
+    return true;
   }
 
   function maskEmail(email) {
@@ -1006,13 +1154,33 @@
       const beforeHref = getCurrentHref();
       createBtn.click();
 
-      const result = await waitAttemptByUi(beforeHref, CONFIG.REGISTER_TIMEOUT_MS);
+      const attemptTimeoutMs = Math.max(1000, Number(CONFIG.PAGE_STUCK_TIMEOUT_MS || CONFIG.REGISTER_TIMEOUT_MS || 180000));
+      const result = await waitAttemptByUi(beforeHref, attemptTimeoutMs);
       if (result.ok) {
         log(`注册成功（${result.reason}）`);
         if (typeof onSuccess === 'function') {
           onSuccess({ is_active: true, email: expectedEmail, detectedBy: result.reason });
         }
         return true;
+      }
+
+      if (result.reason === 'timeout') {
+        const fullAutoEnabled = isFullAutoEnabled();
+        const timeoutSeconds = (attemptTimeoutMs / 1000).toFixed(0);
+        warn(`注册失败：页面卡住超过 ${timeoutSeconds} 秒`);
+
+        if (fullAutoEnabled) {
+          try {
+            await clearAllCookiesForCurrentSite();
+          } catch (e) {
+            warn('全自动模式：页面卡住超时后清理 Cookie 失败，将继续跳回注册页:', e);
+          }
+          clearState();
+          log('已启用全自动循环：页面卡住超时，清理 Cookie 后跳回注册页重新开始');
+          scheduleFullAutoRestartToSignup();
+        }
+
+        throw new Error(`注册失败：页面卡住超过 ${timeoutSeconds} 秒`);
       }
 
       if (result.reason === 'redirected_to_login') {
@@ -1055,7 +1223,7 @@
 
   function inferPostVerifyPhaseByPath(path) {
     const p = String(path || '');
-    if (p.startsWith('/admin/api-key')) return 'post_verify_reporting_cookie';
+    if (p.startsWith('/admin/api-key')) return 'post_verify_open_agent_page';
     return 'post_verify_open_agent_page';
   }
 
@@ -1131,54 +1299,105 @@
   }
 
   async function createAgentOnCurrentPage(state) {
-    log('开始创建 Agent...');
+    log('开始执行验证后流程：先上报 Cookie，再创建 Agent...');
+
+    const cookieResult = await reportCookieOnCurrentPage(state);
+    const fullAutoEnabled = isFullAutoEnabled();
 
     const agentName = state.agentName || makeAgentName();
-    saveState({ phase: 'post_verify_creating_agent', agentName });
+    let assistantId = null;
+    let agentCreated = false;
+    let agentError = null;
 
-    const nameInput = await waitForElement("input[name='name'], input[placeholder*='Agent'], input[aria-label*='Agent']", CONFIG.AGENT_TIMEOUT_MS);
-    if (!nameInput) {
-      throw new Error('创建 Agent 失败：未找到名称输入框');
+    try {
+      saveState({ phase: 'post_verify_creating_agent', agentName });
+
+      const nameInput = await waitForElement("input[name='name'], input[placeholder*='Agent'], input[aria-label*='Agent']", CONFIG.AGENT_TIMEOUT_MS);
+      if (!nameInput) {
+        throw new Error('创建 Agent 失败：未找到名称输入框');
+      }
+
+      await typeLikeHuman(nameInput, agentName, 40, 120);
+      await sleep(randInt(140, 340));
+
+      let submitBtn = document.querySelector("button[type='submit']");
+      if (!submitBtn || submitBtn.disabled) {
+        submitBtn = findButtonByText(['create', '创建']);
+      }
+      if (!submitBtn) {
+        throw new Error('创建 Agent 失败：未找到提交按钮');
+      }
+
+      submitBtn.click();
+      log(`已提交 Agent 创建: ${agentName}`);
+
+      const successHref = await waitForCondition(() => {
+        const href = getCurrentHref();
+        if (href.includes('/app?assistantId=')) return href;
+        return null;
+      }, CONFIG.AGENT_TIMEOUT_MS, 250);
+
+      if (!successHref) {
+        throw new Error('创建 Agent 后未跳转到 /app?assistantId=...');
+      }
+
+      assistantId = extractAssistantIdFromHref(successHref);
+      agentCreated = true;
+      log(`Agent 创建成功: name=${agentName}, assistantId=${assistantId || 'unknown'}`);
+    } catch (e) {
+      agentError = String(e);
+      warn('创建 Agent 失败（Cookie 已上报）:', e);
+
+      if (!fullAutoEnabled) {
+        throw e;
+      }
     }
 
-    await typeLikeHuman(nameInput, agentName, 40, 120);
-    await sleep(randInt(140, 340));
+    saveLastRegisteredAccount({
+      fastapiusersauth: cookieResult.authValue,
+      fastapiusersoauthcsrf: cookieResult.csrfValue || null,
+      cookie: cookieResult.cookieString,
+      cookie_format: cookieResult.csrfValue ? 'dual' : 'legacy_single',
+      appendResult: cookieResult.appendResult,
+      agentName: agentCreated ? agentName : null,
+      assistantId: assistantId || null,
+      agentCreated,
+      agentError,
+      postVerifiedAt: Date.now(),
+    });
 
-    let submitBtn = document.querySelector("button[type='submit']");
-    if (!submitBtn || submitBtn.disabled) {
-      submitBtn = findButtonByText(['create', '创建']);
-    }
-    if (!submitBtn) {
-      throw new Error('创建 Agent 失败：未找到提交按钮');
-    }
-
-    submitBtn.click();
-    log(`已提交 Agent 创建: ${agentName}`);
-
-    const successHref = await waitForCondition(() => {
-      const href = getCurrentHref();
-      if (href.includes('/app?assistantId=')) return href;
-      return null;
-    }, CONFIG.AGENT_TIMEOUT_MS, 250);
-
-    if (!successHref) {
-      throw new Error('创建 Agent 后未跳转到 /app?assistantId=...');
-    }
-
-    const assistantId = extractAssistantIdFromHref(successHref);
-    saveLastRegisteredAccount({ agentName, assistantId: assistantId || null });
     saveState({
-      phase: 'post_verify_reporting_cookie',
-      agentName,
+      phase: 'post_verify_done',
+      fastapiusersauth: cookieResult.authValue,
+      fastapiusersoauthcsrf: cookieResult.csrfValue || null,
+      cookie: cookieResult.cookieString,
+      appendResult: cookieResult.appendResult,
+      agentName: agentCreated ? agentName : null,
       assistantId: assistantId || null,
+      agentCreated,
+      agentError,
+      completedAt: Date.now(),
+      fullAutoEnabled,
     });
 
-    log(`Agent 创建成功: name=${agentName}, assistantId=${assistantId || 'unknown'}`);
-    await reportCookieOnCurrentPage({
-      ...state,
-      agentName,
-      assistantId: assistantId || null,
-    });
+    if (fullAutoEnabled) {
+      try {
+        await clearAllCookiesForCurrentSite();
+      } catch (e) {
+        warn('全自动模式：Cookie 清理失败，将继续跳回注册页:', e);
+      }
+      clearState();
+      if (agentCreated) {
+        log('验证后流程完成（已上报 Cookie + 已创建 Agent），全自动模式将回到注册页继续');
+      } else {
+        log('验证后流程完成（已上报 Cookie，Agent 创建失败已忽略），全自动模式将回到注册页继续');
+      }
+      scheduleFullAutoRestartToSignup();
+      return true;
+    }
+
+    clearState();
+    log('验证后流程完成（已上报 Cookie + 已创建 Agent）');
     return true;
   }
 
@@ -1214,35 +1433,22 @@
       postVerifiedAt: Date.now(),
     });
 
-    const appendSuccess = Boolean(appendResult && appendResult.ok === true);
-    const fullAutoEnabled = isFullAutoEnabled();
-
     saveState({
-      phase: 'post_verify_done',
+      phase: 'post_verify_creating_agent',
       fastapiusersauth: authValue,
       fastapiusersoauthcsrf: csrfValue || null,
       cookie: cookieString,
       appendResult,
-      completedAt: Date.now(),
-      fullAutoEnabled,
+      cookieReportedAt: Date.now(),
     });
 
-    if (appendSuccess && fullAutoEnabled) {
-      try {
-        await clearAllCookiesForCurrentSite();
-      } catch (e) {
-        warn('全自动模式：Cookie 清理失败，将继续跳回注册页:', e);
-      }
-
-      clearState();
-      log(`Cookie 上报成功，已进入全自动重启流程: ${authValue.slice(0, 12)}...`);
-      scheduleFullAutoRestartToSignup();
-      return true;
-    }
-
-    clearState();
     log(`Cookie 上报流程完成: ${authValue.slice(0, 12)}...`);
-    return true;
+    return {
+      authValue,
+      csrfValue,
+      cookieString,
+      appendResult,
+    };
   }
 
   function isPostVerifyPhase(phase) {
@@ -1284,7 +1490,7 @@
 
     if (!isPostVerifyPhase(state.phase)) {
       if (path.startsWith('/admin/api-key')) {
-        state = { ...state, phase: 'post_verify_reporting_cookie' };
+        state = { ...state, phase: 'post_verify_open_agent_page' };
       } else if (path.startsWith('/app/agents/create')) {
         state = { ...state, phase: 'post_verify_creating_agent' };
       } else if (path.startsWith('/app')) {
@@ -1315,12 +1521,18 @@
         || state.phase === 'post_verify_open_api_key_page'
         || state.phase === 'post_verify_creating_api_key'
       ) {
-        await reportCookieOnCurrentPage(state);
+        if (!path.startsWith('/app/agents/create')) {
+          saveState({ phase: 'post_verify_open_agent_page' });
+          window.location.href = 'https://cloud.onyx.app/app/agents/create';
+          return true;
+        }
+        await createAgentOnCurrentPage(state);
         return true;
       }
 
       if (path.startsWith('/admin/api-key')) {
-        await reportCookieOnCurrentPage(state);
+        saveState({ phase: 'post_verify_open_agent_page' });
+        window.location.href = 'https://cloud.onyx.app/app/agents/create';
         return true;
       }
 
@@ -1498,6 +1710,7 @@
 
     const btn = document.getElementById('onyx-auto-register-btn');
     running = true;
+    startNewPageStuckGuard(`start:${source}`);
 
     if (btn) {
       btn.disabled = true;
@@ -1513,6 +1726,7 @@
     } catch (e) {
       err('自动注册失败:', e);
       running = false;
+      clearPageStuckGuard();
       if (btn) {
         btn.disabled = false;
         btn.style.opacity = '1';
@@ -1675,6 +1889,7 @@
     const start = () => {
       const path = window.location.pathname;
       createFullAutoToggleButton();
+      restorePageStuckGuardFromStateIfNeeded();
 
       const isWaitingPage = path.startsWith('/auth/waiting-on-verification');
       if (isWaitingPage) {

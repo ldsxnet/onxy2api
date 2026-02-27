@@ -35,6 +35,60 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("onyx2api")
 
+COOKIE_ID_PREFIX = "cid_"
+COOKIE_ENTRY_SEP = "\t"
+
+
+def _new_cookie_id() -> str:
+    return f"{COOKIE_ID_PREFIX}{secrets.token_hex(8)}"
+
+
+def _split_cookie_entry(value: str) -> tuple[str, str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return "", ""
+
+    if COOKIE_ENTRY_SEP in raw:
+        maybe_id, cookie = raw.split(COOKIE_ENTRY_SEP, 1)
+        cookie_id = maybe_id.strip()
+        cookie_str = cookie.strip()
+        if cookie_id.startswith(COOKIE_ID_PREFIX):
+            return cookie_id, cookie_str
+
+    return "", raw
+
+
+def _cookie_entry_id(value: str) -> str:
+    cookie_id, _ = _split_cookie_entry(value)
+    return cookie_id
+
+
+def _cookie_entry_value(value: str) -> str:
+    _, cookie = _split_cookie_entry(value)
+    return cookie.strip()
+
+
+def _build_cookie_entry(cookie_id: str, cookie_str: str) -> str:
+    cid = cookie_id.strip() if cookie_id.strip().startswith(COOKIE_ID_PREFIX) else _new_cookie_id()
+    cookie = cookie_str.strip()
+    if not cookie:
+        return ""
+    return f"{cid}{COOKIE_ENTRY_SEP}{cookie}"
+
+
+def _is_cookie_id(value: str) -> bool:
+    return str(value or "").strip().startswith(COOKIE_ID_PREFIX)
+
+
+def _cookie_by_id(cookies: list[str], cookie_id: str) -> str:
+    cid = cookie_id.strip()
+    if not cid:
+        return ""
+    for item in cookies:
+        if _cookie_entry_id(item) == cid:
+            return _cookie_entry_value(item)
+    return ""
+
 
 @dataclass
 class ProviderModel:
@@ -98,7 +152,7 @@ class ConfigStore:
 
     @staticmethod
     def _cookie_identity(cookie: str) -> str:
-        raw = cookie.strip()
+        raw = _cookie_entry_value(cookie).strip()
         if not raw:
             return ""
 
@@ -129,17 +183,37 @@ class ConfigStore:
         seen: set[str] = set()
         for item in values:
             v = item.strip()
-            if not v:
+            if not v or v in seen:
                 continue
-            key = cls._cookie_identity(v) or f"raw:{v}"
-            if key in seen:
-                continue
-            seen.add(key)
+            seen.add(v)
             out.append(v)
         return out
 
+    @classmethod
+    def _norm_onyx_cookies(cls, values: list[str]) -> list[str]:
+        out: list[str] = []
+        seen_identity: set[str] = set()
+        seen_id: set[str] = set()
+
+        for item in values:
+            cookie_id, cookie = _split_cookie_entry(item)
+            cookie = cookie.strip()
+            if not cookie:
+                continue
+
+            identity = cls._cookie_identity(cookie) or f"raw:{cookie}"
+            if identity in seen_identity:
+                continue
+
+            cid = cookie_id if cookie_id and cookie_id not in seen_id else _new_cookie_id()
+            seen_identity.add(identity)
+            seen_id.add(cid)
+            out.append(_build_cookie_entry(cid, cookie))
+
+        return out
+
     def _normalize(self, cfg: AppConfig) -> AppConfig:
-        cfg.onyx_cookies = self._norm_keys(cfg.onyx_cookies)
+        cfg.onyx_cookies = self._norm_onyx_cookies(cfg.onyx_cookies)
         cfg.client_api_keys = self._norm_keys(cfg.client_api_keys)
         if cfg.client_api_keys and not cfg.onyx_cookies:
             raise ValueError("client_api_keys 已配置时，onyx_cookies 不能为空")
@@ -335,8 +409,8 @@ def _split_cookie_pairs(cookie_str: str) -> dict[str, str]:
 
 def _extract_auth_value(cookie_str: str) -> str:
     # 兼容完整 Cookie 串或仅 fastapiusersauth 的值
-    raw = cookie_str.strip()
-    if not raw:
+    raw = _cookie_entry_value(cookie_str).strip()
+    if not raw or _is_cookie_id(raw):
         return ""
 
     pairs = _split_cookie_pairs(raw)
@@ -349,7 +423,7 @@ def _extract_auth_value(cookie_str: str) -> str:
 
 
 def _extract_csrf_value(cookie_str: str) -> str:
-    raw = cookie_str.strip()
+    raw = _cookie_entry_value(cookie_str).strip()
     if not raw:
         return ""
     return _split_cookie_pairs(raw).get("fastapiusersoauthcsrf", "").strip()
@@ -386,10 +460,21 @@ def _extract_set_cookie_value(set_cookie_header: str, cookie_name: str) -> str:
 
 
 def _cookie_error_identifier(cookie_str: str) -> str:
-    csrf = _extract_csrf_value(cookie_str)
+    raw = str(cookie_str or "").strip()
+    if not raw:
+        return ""
+
+    if _is_cookie_id(raw):
+        return raw
+
+    entry_id = _cookie_entry_id(raw)
+    if entry_id:
+        return entry_id
+
+    csrf = _extract_csrf_value(raw)
     if csrf:
         return f"csrf:{csrf}"
-    auth = _extract_auth_value(cookie_str).strip()
+    auth = _extract_auth_value(raw).strip()
     return f"auth:{auth}" if auth else ""
 
 
@@ -479,74 +564,60 @@ async def refresh_onyx_auth_cookie(cfg: AppConfig, cookie_str: str) -> str:
     return refreshed_cookie
 
 
-async def persist_refreshed_cookie(cfg: AppConfig, old_cookie: str, new_cookie: str) -> None:
-    old = old_cookie.strip()
-    new_val = new_cookie.strip()
-    if not old or not new_val:
+async def persist_refreshed_cookie(cfg: AppConfig, cookie_ref: str, new_cookie: str) -> None:
+    ref = str(cookie_ref or "").strip()
+    new_val = _cookie_entry_value(new_cookie).strip()
+    if not ref or not new_val:
         return
-
-    if not cfg.onyx_cookies:
-        return
-
-    old_auth = _extract_auth_value(old)
-    old_csrf = _extract_csrf_value(old)
-
-    replaced = False
-    next_cookies: list[str] = []
-    for item in cfg.onyx_cookies:
-        item_auth = _extract_auth_value(item)
-        item_csrf = _extract_csrf_value(item)
-        should_replace = (
-            item == old
-            or (old_csrf and item_csrf == old_csrf)
-            or (old_auth and item_auth == old_auth)
-        )
-
-        if should_replace and not replaced:
-            next_cookies.append(new_val)
-            replaced = True
-            continue
-
-        if should_replace and replaced:
-            continue
-
-        next_cookies.append(item)
-
-    if not replaced:
-        return
-
-    cfg.onyx_cookies = next_cookies
 
     try:
         latest = await run_in_threadpool(store.get)
-        latest_auth = _extract_auth_value(old)
-        latest_csrf = _extract_csrf_value(old)
+        if not latest.onyx_cookies:
+            return
+
+        target_id = ref if _is_cookie_id(ref) else _cookie_entry_id(ref)
+        replaced = False
         merged: list[str] = []
-        merged_replaced = False
 
-        for item in latest.onyx_cookies:
-            item_auth = _extract_auth_value(item)
-            item_csrf = _extract_csrf_value(item)
-            same_cookie = (
-                item == old
-                or (latest_csrf and item_csrf == latest_csrf)
-                or (latest_auth and item_auth == latest_auth)
-            )
+        if target_id:
+            for item in latest.onyx_cookies:
+                item_id = _cookie_entry_id(item)
+                if item_id == target_id:
+                    if not replaced:
+                        merged.append(_build_cookie_entry(target_id, new_val))
+                        replaced = True
+                    continue
+                merged.append(item)
+        else:
+            target_cookie = _cookie_entry_value(ref).strip()
+            target_auth = _extract_auth_value(target_cookie)
+            target_csrf = _extract_csrf_value(target_cookie)
 
-            if same_cookie and not merged_replaced:
-                merged.append(new_val)
-                merged_replaced = True
-                continue
+            for item in latest.onyx_cookies:
+                item_cookie = _cookie_entry_value(item)
+                item_auth = _extract_auth_value(item_cookie)
+                item_csrf = _extract_csrf_value(item_cookie)
+                same_cookie = (
+                    item_cookie == target_cookie
+                    or (target_csrf and item_csrf == target_csrf)
+                    or (target_auth and item_auth == target_auth)
+                )
 
-            if same_cookie and merged_replaced:
-                continue
+                if same_cookie:
+                    if not replaced:
+                        keep_id = _cookie_entry_id(item) or _new_cookie_id()
+                        merged.append(_build_cookie_entry(keep_id, new_val))
+                        replaced = True
+                    continue
 
-            merged.append(item)
+                merged.append(item)
 
-        if merged_replaced:
-            latest.onyx_cookies = merged
-            saved = await run_in_threadpool(store.set, latest)
-            cfg.onyx_cookies = saved.onyx_cookies
+        if not replaced:
+            return
+
+        latest.onyx_cookies = merged
+        saved = await run_in_threadpool(store.set, latest)
+        cfg.onyx_cookies = saved.onyx_cookies
     except Exception as exc:  # noqa: BLE001
         logger.warning("Persist refreshed cookie failed: %s", exc)
 
@@ -558,7 +629,27 @@ def next_cookie(cookies: list[str]) -> str:
     with _cookie_lock:
         idx = _cookie_index % len(cookies)
         _cookie_index += 1
-    return cookies[idx]
+    entry = cookies[idx]
+    return _cookie_entry_id(entry) or _cookie_entry_value(entry)
+
+
+def resolve_cookie_for_request(cfg: AppConfig, cookie_ref: str) -> tuple[str, str]:
+    raw = str(cookie_ref or "").strip()
+    if not raw:
+        return "", ""
+
+    if _is_cookie_id(raw):
+        return raw, _cookie_by_id(cfg.onyx_cookies, raw)
+
+    entry_id = _cookie_entry_id(raw)
+    if entry_id:
+        return entry_id, _cookie_entry_value(raw)
+
+    return "", _cookie_entry_value(raw)
+
+
+def public_cookie_values(cookies: list[str]) -> list[str]:
+    return [_cookie_entry_value(item) for item in cookies if _cookie_entry_value(item)]
 
 
 def clear_cookie_error_count(cookie_str: str) -> None:
@@ -572,9 +663,15 @@ def clear_cookie_error_count(cookie_str: str) -> None:
 def get_failed_cookie_items(cfg: AppConfig) -> list[dict[str, Any]]:
     cookie_by_id: dict[str, str] = {}
     for item in cfg.onyx_cookies:
-        cookie_id = _cookie_error_identifier(item)
-        if cookie_id:
-            cookie_by_id[cookie_id] = item
+        entry_id = _cookie_entry_id(item)
+        cookie = _cookie_entry_value(item)
+        if entry_id:
+            cookie_by_id[entry_id] = cookie
+            continue
+
+        legacy_id = _cookie_error_identifier(cookie)
+        if legacy_id:
+            cookie_by_id[legacy_id] = cookie
 
     with _cookie_error_lock:
         snapshot = dict(_cookie_error_counts)
@@ -589,14 +686,14 @@ def get_failed_cookie_items(cfg: AppConfig) -> list[dict[str, Any]]:
         cookie = cookie_by_id.get(cookie_id, "")
         if not cookie:
             continue
-        items.append({"cookie": cookie, "fail_count": fail_count})
+        items.append({"cookie_id": cookie_id, "cookie": cookie, "fail_count": fail_count})
 
     items.sort(key=lambda x: int(x.get("fail_count", 0)), reverse=True)
     return items
 
 
-async def mark_cookie_error(cfg: AppConfig, cookie_str: str, reason: str) -> None:
-    cookie_id = _cookie_error_identifier(cookie_str)
+async def mark_cookie_error(cfg: AppConfig, cookie_ref: str, reason: str) -> None:
+    cookie_id = _cookie_error_identifier(cookie_ref)
     if not cookie_id:
         return
 
@@ -605,9 +702,10 @@ async def mark_cookie_error(cfg: AppConfig, cookie_str: str, reason: str) -> Non
         _cookie_error_counts[cookie_id] = fail_count
 
     logger.warning(
-        "Cookie auth failed (%s/%s): %s",
+        "Cookie auth failed (%s/%s) [%s]: %s",
         fail_count,
         ONYX_COOKIE_ERROR_LIMIT,
+        cookie_id,
         reason,
     )
 
@@ -621,22 +719,34 @@ async def mark_cookie_error(cfg: AppConfig, cookie_str: str, reason: str) -> Non
     if not cur_cfg.onyx_cookies:
         return
 
-    target = cookie_str.strip()
-    target_auth = _extract_auth_value(cookie_str)
-    target_csrf = _extract_csrf_value(cookie_str)
+    target_ref = str(cookie_ref or "").strip()
+    target_id = cookie_id if _is_cookie_id(cookie_id) else ""
+    target_cookie = _cookie_entry_value(target_ref)
+    target_auth = _extract_auth_value(target_cookie)
+    target_csrf = _extract_csrf_value(target_cookie)
     kept_cookies: list[str] = []
     removed_count = 0
 
     for item in cur_cfg.onyx_cookies:
-        item_auth = _extract_auth_value(item)
-        item_csrf = _extract_csrf_value(item)
-        if (
-            item == target
-            or (target_csrf and item_csrf == target_csrf)
-            or (target_auth and item_auth == target_auth)
-        ):
+        item_id = _cookie_entry_id(item)
+        item_cookie = _cookie_entry_value(item)
+        item_auth = _extract_auth_value(item_cookie)
+        item_csrf = _extract_csrf_value(item_cookie)
+
+        should_remove = False
+        if target_id:
+            should_remove = item_id == target_id
+        else:
+            should_remove = (
+                item_cookie == target_cookie
+                or (target_csrf and item_csrf == target_csrf)
+                or (target_auth and item_auth == target_auth)
+            )
+
+        if should_remove:
             removed_count += 1
             continue
+
         kept_cookies.append(item)
 
     if removed_count <= 0:
@@ -660,8 +770,9 @@ async def mark_cookie_error(cfg: AppConfig, cookie_str: str, reason: str) -> Non
         _cookie_error_counts.pop(cookie_id, None)
 
     logger.error(
-        "Removed invalid Onyx cookie after %s failures, remaining cookies=%s",
+        "Removed invalid Onyx cookie after %s failures [%s], remaining cookies=%s",
         fail_count,
+        cookie_id,
         len(cfg.onyx_cookies),
     )
 
@@ -766,9 +877,14 @@ def messages_to_onyx(system: str, msgs: list[ChatMsg]) -> str:
     return "\n".join(out).strip()
 
 
-async def create_chat_session(cfg: AppConfig, auth_cookie: str, persona: int) -> tuple[str, str]:
+async def create_chat_session(cfg: AppConfig, cookie_ref: str, persona: int) -> tuple[str, str, str]:
     if http is None:
         raise RuntimeError("HTTP client is not initialized")
+
+    ref = str(cookie_ref or "").strip()
+    cookie_id, auth_cookie = resolve_cookie_for_request(cfg, ref)
+    if not auth_cookie:
+        raise RuntimeError("Onyx auth cookie not found by cookie_id")
 
     refreshed_cookie = await refresh_onyx_auth_cookie(cfg, auth_cookie)
     effective_cookie = refreshed_cookie or auth_cookie
@@ -791,15 +907,16 @@ async def create_chat_session(cfg: AppConfig, auth_cookie: str, persona: int) ->
     if not chat_session_id:
         raise RuntimeError(f"create-chat-session missing chat_session_id: {data}")
 
+    effective_ref = cookie_id or ref
     if refreshed_cookie:
-        await persist_refreshed_cookie(cfg, auth_cookie, refreshed_cookie)
+        await persist_refreshed_cookie(cfg, effective_ref, refreshed_cookie)
 
-    return str(chat_session_id), effective_cookie
+    return str(chat_session_id), effective_cookie, effective_ref
 
 
 async def do_onyx_request(
     cfg: AppConfig,
-    auth_cookie: str,
+    cookie_ref: str,
     model: str,
     msgs: list[ChatMsg],
     system: str,
@@ -815,7 +932,7 @@ async def do_onyx_request(
 
     for attempt in range(max_attempts):
         current_total = max(len(cfg.onyx_cookies), 1)
-        cur_cookie = auth_cookie if attempt == 0 else (next_cookie(cfg.onyx_cookies) if cfg.onyx_cookies else auth_cookie)
+        cur_ref = cookie_ref if attempt == 0 else (next_cookie(cfg.onyx_cookies) if cfg.onyx_cookies else cookie_ref)
         cookie_idx = attempt % current_total
         round_num = attempt // current_total
 
@@ -829,8 +946,12 @@ async def do_onyx_request(
                 round_num + 1,
             )
 
+        active_ref = cur_ref
+        active_cookie = ""
         try:
-            chat_session_id, effective_cookie = await create_chat_session(cfg, cur_cookie, persona)
+            chat_session_id, effective_cookie, effective_ref = await create_chat_session(cfg, cur_ref, persona)
+            active_ref = (effective_ref or cur_ref).strip() or cur_ref
+            active_cookie = effective_cookie.strip()
             body = {
                 "message": messages_to_onyx(system, msgs),
                 "chat_session_id": chat_session_id,
@@ -853,13 +974,13 @@ async def do_onyx_request(
                 f"{cfg.onyx_base.rstrip('/')}/api/chat/send-chat-message",
                 json=body,
                 headers=build_onyx_headers(cfg, with_json=True),
-                cookies=_build_onyx_request_cookies(effective_cookie),
+                cookies=_build_onyx_request_cookies(active_cookie),
                 timeout=httpx.Timeout(float(cfg.request_timeout_seconds), connect=30.0),
             )
             resp = await http.send(req, stream=True)
         except (httpx.HTTPError, RuntimeError) as exc:
             last_err = exc
-            await mark_cookie_error(cfg, cur_cookie, str(exc))
+            await mark_cookie_error(cfg, active_ref, str(exc))
             wait = RETRY_BACKOFF[min(round_num, len(RETRY_BACKOFF) - 1)]
             logger.warning("Attempt %s failed (%s), retry in %ss", attempt + 1, exc, wait)
             await asyncio.sleep(wait)
@@ -876,14 +997,15 @@ async def do_onyx_request(
                 status = 503
 
             last_err = OnyxHTTPError(status, body_text)
-            await mark_cookie_error(cfg, cur_cookie, f"HTTP {status}")
+            await mark_cookie_error(cfg, active_ref, f"HTTP {status}")
             wait = RETRY_BACKOFF[min(round_num, len(RETRY_BACKOFF) - 1)]
             logger.warning("Attempt %s failed (HTTP %s), trying next cookie in %ss", attempt + 1, status, wait)
             await asyncio.sleep(wait)
             continue
 
-        resp.extensions["onyx_cookie"] = cur_cookie
-        clear_cookie_error_count(cur_cookie)
+        resp.extensions["onyx_cookie_ref"] = active_ref
+        resp.extensions["onyx_cookie"] = active_cookie
+        clear_cookie_error_count(active_ref)
         return resp
 
     raise last_err if last_err is not None else RuntimeError("all retries failed")
@@ -912,7 +1034,7 @@ async def iter_onyx_events(resp: httpx.Response) -> AsyncIterator[dict[str, Any]
 
 async def safe_iter_onyx_events(
     cfg: AppConfig,
-    auth_cookie: str,
+    cookie_ref: str,
     model: str,
     msgs: list[ChatMsg],
     system: str,
@@ -924,19 +1046,19 @@ async def safe_iter_onyx_events(
     max_stream_retries = total_cookies * 2
 
     for stream_attempt in range(max_stream_retries):
-        cur_cookie = auth_cookie if stream_attempt == 0 else (next_cookie(cfg.onyx_cookies) if cfg.onyx_cookies else auth_cookie)
+        cur_ref = cookie_ref if stream_attempt == 0 else (next_cookie(cfg.onyx_cookies) if cfg.onyx_cookies else cookie_ref)
 
         try:
             resp = await do_onyx_request(
                 cfg,
-                cur_cookie,
+                cur_ref,
                 model,
                 msgs,
                 system,
                 temp,
                 cfg.default_persona if persona is None else persona,
             )
-            used_cookie = str(resp.extensions.get("onyx_cookie") or cur_cookie)
+            used_ref = str(resp.extensions.get("onyx_cookie_ref") or cur_ref)
         except Exception as exc:
             logger.error("do_onyx_request failed on stream attempt %s: %s", stream_attempt + 1, exc)
             if stream_attempt < max_stream_retries - 1:
@@ -976,11 +1098,11 @@ async def safe_iter_onyx_events(
         yield resp, checked_events()
 
         if not has_error:
-            clear_cookie_error_count(used_cookie)
+            clear_cookie_error_count(used_ref)
             return
 
         if upstream_rejected:
-            await mark_cookie_error(cfg, used_cookie, f"upstream rejected stream: {error_msg}")
+            await mark_cookie_error(cfg, used_ref, f"upstream rejected stream: {error_msg}")
 
         await resp.aclose()
         logger.warning(
@@ -1646,6 +1768,7 @@ async def get_config(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="invalid admin password")
     data = cfg.model_dump()
     data.pop("admin_password", None)
+    data["onyx_cookies"] = public_cookie_values(cfg.onyx_cookies)
     return {"config": data}
 
 
@@ -1673,6 +1796,7 @@ async def save_config(payload: ConfigUpdate, request: Request) -> dict[str, Any]
 
     data = saved.model_dump()
     data.pop("admin_password", None)
+    data["onyx_cookies"] = public_cookie_values(saved.onyx_cookies)
     return {"ok": True, "config": data}
 
 
@@ -1692,6 +1816,7 @@ async def append_onyx_cookie(payload: AppendOnyxCookieReq, request: Request) -> 
         "ok": True,
         "inserted": inserted,
         "total": len(saved.onyx_cookies),
+        "cookies": public_cookie_values(saved.onyx_cookies),
     }
 
 
@@ -1726,7 +1851,7 @@ async def verify_onyx_cookie(payload: VerifyCookieReq, request: Request) -> dict
         raise HTTPException(status_code=500, detail="HTTP client not initialized")
 
     try:
-        chat_session_id, effective_cookie = await create_chat_session(cfg, cookie, cfg.default_persona)
+        chat_session_id, effective_cookie, _ = await create_chat_session(cfg, cookie, cfg.default_persona)
         body = {
             "message": "Hi",
             "chat_session_id": chat_session_id,
@@ -1840,7 +1965,18 @@ async def remove_onyx_cookies(payload: RemoveCookiesReq, request: Request) -> di
     if not to_remove:
         raise HTTPException(status_code=400, detail="cookies list is empty")
 
-    new_cookies = [k for k in cfg.onyx_cookies if k not in to_remove]
+    new_cookies: list[str] = []
+    removed_ids: set[str] = set()
+    for item in cfg.onyx_cookies:
+        item_id = _cookie_entry_id(item)
+        item_cookie = _cookie_entry_value(item)
+        should_remove = item in to_remove or item_cookie in to_remove or (item_id and item_id in to_remove)
+        if should_remove:
+            if item_id:
+                removed_ids.add(item_id)
+            continue
+        new_cookies.append(item)
+
     removed_count = len(cfg.onyx_cookies) - len(new_cookies)
 
     cfg.onyx_cookies = new_cookies
@@ -1849,10 +1985,16 @@ async def remove_onyx_cookies(payload: RemoveCookiesReq, request: Request) -> di
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    if removed_ids:
+        with _cookie_error_lock:
+            for cookie_id in removed_ids:
+                _cookie_error_counts.pop(cookie_id, None)
+
     return {
         "ok": True,
         "removed": removed_count,
         "remaining": len(saved.onyx_cookies),
+        "cookies": public_cookie_values(saved.onyx_cookies),
     }
 
 
@@ -1883,7 +2025,7 @@ async def remove_failed_onyx_cookies(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="invalid admin password")
 
     failed_items = get_failed_cookie_items(cfg)
-    failed_ids = {_cookie_error_identifier(item.get("cookie", "")) for item in failed_items}
+    failed_ids = {str(item.get("cookie_id") or "").strip() for item in failed_items}
     failed_ids = {item for item in failed_ids if item}
 
     if not failed_ids:
@@ -1897,13 +2039,21 @@ async def remove_failed_onyx_cookies(request: Request) -> dict[str, Any]:
     removed_count = 0
     removed_ids: set[str] = set()
 
-    for cookie in cfg.onyx_cookies:
-        cookie_id = _cookie_error_identifier(cookie)
-        if cookie_id and cookie_id in failed_ids:
+    for entry in cfg.onyx_cookies:
+        entry_id = _cookie_entry_id(entry)
+        if entry_id and entry_id in failed_ids:
             removed_count += 1
-            removed_ids.add(cookie_id)
+            removed_ids.add(entry_id)
             continue
-        kept_cookies.append(cookie)
+
+        # 兼容老数据：无 id 时退回旧标识匹配
+        legacy_id = _cookie_error_identifier(_cookie_entry_value(entry))
+        if legacy_id and legacy_id in failed_ids:
+            removed_count += 1
+            removed_ids.add(legacy_id)
+            continue
+
+        kept_cookies.append(entry)
 
     if removed_count <= 0:
         return {
@@ -1932,6 +2082,7 @@ async def remove_failed_onyx_cookies(request: Request) -> dict[str, Any]:
         "ok": True,
         "removed": removed_count,
         "remaining": len(saved.onyx_cookies),
+        "cookies": public_cookie_values(saved.onyx_cookies),
     }
 
 
