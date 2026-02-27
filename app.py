@@ -261,7 +261,13 @@ async def on_startup() -> None:
     limits = httpx.Limits(max_connections=200, max_keepalive_connections=100)
     http = httpx.AsyncClient(http2=True, limits=limits)
     cfg = store.get()
-    logger.info("管理页面密码：admin_password=%s", cfg.admin_password)
+    
+    # Check if a custom password was provided via environment variable
+    if ADMIN_PASSWORD:
+        logger.info("管理页面已启用自定义配置密码")
+    else:
+        # Only log the auto-generated password if no custom password was set
+        logger.info("系统生成了随机管理页面密码：admin_password=%s", cfg.admin_password)
 
 
 @app.on_event("shutdown")
