@@ -2152,11 +2152,12 @@ if __name__ == "__main__":
     import uvicorn
 
     c = store.get()
+    display_pwd = "***" if ADMIN_PASSWORD else c.admin_password
     logger.info(
         "onyx2api v%s | onyx_cookies=%s | client_keys=%s | admin_password=%s",
         VERSION,
         len(c.onyx_cookies),
         len(c.client_api_keys),
-        c.admin_password,
+        display_pwd,
     )
     uvicorn.run("app:app", host="0.0.0.0", port=19898, reload=False)
