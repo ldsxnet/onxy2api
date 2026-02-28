@@ -18,6 +18,9 @@ from fastapi.templating import Jinja2Templates
 from pydantic import AliasChoices, BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
+CONFIG_FILE_PATH = os.getenv("CONFIG_FILE_PATH", "/data/config.json")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+
 VERSION = "0.6.0-py"
 ONYX_BASE_URL = os.getenv("ONYX_BASE_URL", "https://cloud.onyx.app").rstrip("/")
 ONYX_AUTH_COOKIE = os.getenv("ONYX_AUTH_COOKIE", "")
@@ -229,7 +232,7 @@ class ConfigStore:
         if not cfg.onyx_base.strip():
             cfg.onyx_base = ONYX_BASE_DEFAULT
         if not cfg.admin_password.strip():
-            cfg.admin_password = generate_admin_password()
+            cfg.admin_password = ADMIN_PASSWORD if ADMIN_PASSWORD else generate_admin_password()
         return cfg
 
     def load(self) -> None:
@@ -299,7 +302,13 @@ class AnthropicReq(BaseModel):
 
 
 BASE_DIR = Path(__file__).resolve().parent
-store = ConfigStore(BASE_DIR / "config.json")
+
+config_path_obj = Path(CONFIG_FILE_PATH)
+if not config_path_obj.is_absolute():
+    config_path_obj = BASE_DIR / config_path_obj
+config_path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+store = ConfigStore(config_path_obj)
 store.load()
 
 app = FastAPI(title="onyx2api-py", version=VERSION)
@@ -328,7 +337,10 @@ async def on_startup() -> None:
     limits = httpx.Limits(max_connections=200, max_keepalive_connections=50, keepalive_expiry=15.0)
     http = httpx.AsyncClient(http2=ONYX_HTTP2_ENABLED, limits=limits)
     cfg = store.get()
-    logger.info("管理页面密码：admin_password=%s", cfg.admin_password)
+    if ADMIN_PASSWORD:
+        logger.info("管理页面已启用自定义配置密码")
+    else:
+        logger.info("系统生成了随机管理页面密码：admin_password=%s", cfg.admin_password)
     logger.info("Onyx upstream http2=%s | max_conn=%s | max_keepalive=%s", ONYX_HTTP2_ENABLED, 200, 50)
 
 
@@ -2328,14 +2340,12 @@ if __name__ == "__main__":
     import uvicorn
 
     c = store.get()
+    display_pwd = "***" if ADMIN_PASSWORD else c.admin_password
     logger.info(
         "onyx2api v%s | onyx_cookies=%s | client_keys=%s | admin_password=%s",
         VERSION,
         len(c.onyx_cookies),
         len(c.client_api_keys),
-        c.admin_password,
+        display_pwd,
     )
     uvicorn.run("app:app", host="0.0.0.0", port=19898, reload=False)
-
-CONFIG_FILE_PATH = "/data/config.json"
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
